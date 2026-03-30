@@ -1,10 +1,17 @@
 "use client";
 
-import { useState, useCallback, useRef, type FormEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import type { ENSProfile } from "@/lib/ens";
 import { NetworkGraph, type GraphNode, type GraphEdge } from "@/components/NetworkGraph";
 import { FriendshipsPanel } from "@/components/FriendshipsPanel";
+import {
+  createFriendship,
+  listFriendships,
+  removeFriendship,
+  subscribeToFriendships,
+  type FriendshipRecord,
+} from "@/lib/friendships";
 
 const SUGGESTIONS = ["vitalik.eth", "nick.eth", "brantly.eth", "sassal.eth"];
 
@@ -13,13 +20,6 @@ interface TxSummary {
   totalValueEth: string;
   lastTxTimestamp: number | null;
   types: string[];
-}
-
-interface FriendshipRecord {
-  id: number;
-  ens_a: string;
-  ens_b: string;
-  created_at: string;
 }
 
 export default function GraphPage() {
@@ -59,19 +59,12 @@ export default function GraphPage() {
     []
   );
 
-  const fetchFriendships = useCallback(async (): Promise<FriendshipRecord[]> => {
-    try {
-      const res = await fetch("/api/friendships");
-      if (!res.ok) return [];
-      const data = await res.json();
-      return data.friendships ?? [];
-    } catch {
-      return [];
-    }
+  const fetchFriendships = useCallback((): FriendshipRecord[] => {
+    return listFriendships();
   }, []);
 
-  const refreshFriendshipEdges = useCallback(async () => {
-    const friendships = await fetchFriendships();
+  const refreshFriendshipEdges = useCallback(() => {
+    const friendships = fetchFriendships();
     const currentNodeIds = new Set(nodesRef.current.map((n) => n.ensName));
 
     setEdges((prev) => {
@@ -90,6 +83,11 @@ export default function GraphPage() {
       return [...nonFriendship, ...friendshipEdges];
     });
   }, [fetchFriendships]);
+
+  useEffect(() => {
+    refreshFriendshipEdges();
+    return subscribeToFriendships(refreshFriendshipEdges);
+  }, [refreshFriendshipEdges]);
 
   const addNode = useCallback(
     async (rawInput: string) => {
@@ -159,8 +157,7 @@ export default function GraphPage() {
           setTxLoading(false);
         }
 
-        // Refresh friendship edges after adding a node
-        await refreshFriendshipEdges();
+        refreshFriendshipEdges();
       } catch {
         setError(`Network error resolving ${ensName}`);
       } finally {
@@ -211,12 +208,8 @@ export default function GraphPage() {
 
       setFriendshipLoading(true);
       try {
-        const res = await fetch("/api/friendships", {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ens_a: source, ens_b: target }),
-        });
-        if (res.ok) {
+        const deleted = removeFriendship(source, target);
+        if (deleted) {
           setEdges((prev) =>
             prev.filter(
               (e) =>
@@ -229,11 +222,10 @@ export default function GraphPage() {
           );
           showToast(`Removed friendship: ${source} ↔ ${target}`, "success");
         } else {
-          const data = await res.json();
-          showToast(data.error || "Failed to delete friendship", "error");
+          showToast("Friendship not found", "error");
         }
       } catch {
-        showToast("Network error deleting friendship", "error");
+        showToast("Error deleting friendship", "error");
       } finally {
         setFriendshipLoading(false);
       }
@@ -252,48 +244,27 @@ export default function GraphPage() {
     setError(null);
 
     try {
-      const res = await fetch("/api/friendships", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ens_a: ensA,
-          ens_b: ensB,
-          address_a: nodeA?.address,
-          address_b: nodeB?.address,
-          avatar_a: nodeA?.avatar,
-          avatar_b: nodeB?.avatar,
-          display_name_a: nodeA?.displayName,
-          display_name_b: nodeB?.displayName,
-        }),
-      });
-
-      if (res.ok || res.status === 201) {
-        // Add edge optimistically
-        setEdges((prev) => [
-          ...prev,
-          {
-            source: ensA,
-            target: ensB,
-            txCount: 0,
-            totalValueEth: "0",
-            lastTxTimestamp: null,
-            types: [],
-            edgeType: "friendship" as const,
-          },
-        ]);
+      const result = createFriendship(ensA, ensB, nodeA?.address, nodeB?.address);
+      if (result.friendship) {
+        refreshFriendshipEdges();
         setSelectedNodes([]);
         setSelectionMode(false);
         showToast(`Friendship added: ${ensA} ↔ ${ensB}`, "success");
       } else {
-        const data = await res.json();
-        setError(data.error || "Failed to create friendship");
+        setError(
+          result.reason === "self"
+            ? "Cannot befriend yourself"
+            : result.reason === "duplicate"
+              ? "Friendship already exists"
+              : "Both ENS names are required"
+        );
       }
     } catch {
-      setError("Network error creating friendship");
+      setError("Error creating friendship");
     } finally {
       setFriendshipLoading(false);
     }
-  }, [selectedNodes, showToast]);
+  }, [refreshFriendshipEdges, selectedNodes, showToast]);
 
   const cancelSelection = useCallback(() => {
     setSelectedNodes([]);

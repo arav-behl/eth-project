@@ -1,15 +1,13 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-
-interface FriendshipRecord {
-  id: number;
-  ens_a: string;
-  ens_b: string;
-  address_a: string | null;
-  address_b: string | null;
-  created_at: string;
-}
+import {
+  createFriendship,
+  listFriendships,
+  removeFriendship,
+  subscribeToFriendships,
+  type FriendshipRecord,
+} from "@/lib/friendships";
 
 interface Props {
   isOpen: boolean;
@@ -30,7 +28,7 @@ export function FriendshipsPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
-  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Add-friendship form state
   const [addEnsA, setAddEnsA] = useState("");
@@ -40,13 +38,10 @@ export function FriendshipsPanel({
   // Filter
   const [filterText, setFilterText] = useState("");
 
-  const fetchFriendships = useCallback(async () => {
+  const fetchFriendships = useCallback(() => {
     setLoading(true);
     try {
-      const res = await fetch("/api/friendships");
-      if (!res.ok) throw new Error("Failed to fetch friendships");
-      const data = await res.json();
-      setFriendships(data.friendships ?? []);
+      setFriendships(listFriendships());
     } catch {
       setError("Could not load friendships");
     } finally {
@@ -62,26 +57,26 @@ export function FriendshipsPanel({
     }
   }, [isOpen, fetchFriendships]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    return subscribeToFriendships(fetchFriendships);
+  }, [fetchFriendships, isOpen]);
+
   const handleDelete = async (f: FriendshipRecord) => {
     setDeletingId(f.id);
     setError(null);
     setSuccessMsg(null);
     try {
-      const res = await fetch("/api/friendships", {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ens_a: f.ens_a, ens_b: f.ens_b }),
-      });
-      if (res.ok) {
+      const deleted = removeFriendship(f.ens_a, f.ens_b);
+      if (deleted) {
         setFriendships((prev) => prev.filter((x) => x.id !== f.id));
         setSuccessMsg(`Removed friendship: ${f.ens_a} ↔ ${f.ens_b}`);
         onFriendshipsChanged();
       } else {
-        const data = await res.json();
-        setError(data.error || "Delete failed");
+        setError("Friendship not found");
       }
     } catch {
-      setError("Network error while deleting");
+      setError("Error while deleting");
     } finally {
       setDeletingId(null);
     }
@@ -106,23 +101,24 @@ export function FriendshipsPanel({
     setSuccessMsg(null);
 
     try {
-      const res = await fetch("/api/friendships", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ens_a: ensA, ens_b: ensB }),
-      });
-      if (res.ok || res.status === 201) {
+      const result = createFriendship(ensA, ensB);
+      if (result.friendship) {
         setAddEnsA("");
         setAddEnsB("");
         setSuccessMsg(`Added friendship: ${ensA} ↔ ${ensB}`);
-        await fetchFriendships();
+        fetchFriendships();
         onFriendshipsChanged();
       } else {
-        const data = await res.json();
-        setError(data.error || "Failed to create friendship");
+        setError(
+          result.reason === "self"
+            ? "Cannot befriend yourself"
+            : result.reason === "duplicate"
+              ? "Friendship already exists"
+              : "Enter both ENS names"
+        );
       }
     } catch {
-      setError("Network error while adding");
+      setError("Error while adding");
     } finally {
       setAddLoading(false);
     }
@@ -471,7 +467,7 @@ export function FriendshipsPanel({
           {/* Footer */}
           <div className="flex-shrink-0 px-5 py-3 border-t border-white/[0.06]">
             <p className="text-[10px] text-gray-600 text-center">
-              Friendships are stored in PostgreSQL via Django · Changes sync with the graph in real-time
+              Friendships are stored in this browser and sync with the graph immediately
             </p>
           </div>
         </div>

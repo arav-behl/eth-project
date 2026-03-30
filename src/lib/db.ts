@@ -1,20 +1,41 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
-
-const DB_PATH = path.join(process.cwd(), "data", "ens-explorer.db");
+import os from "os";
 
 let _db: Database.Database | null = null;
 
 function db(): Database.Database {
   if (_db) return _db;
 
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  const candidatePaths = [
+    path.join(process.cwd(), "data", "ens-explorer.db"),
+    path.join(os.tmpdir(), "ens-explorer.db"),
+  ];
+
+  let lastError: unknown = null;
+
+  for (const dbPath of candidatePaths) {
+    try {
+      const dir = path.dirname(dbPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      _db = new Database(dbPath);
+      break;
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  _db = new Database(DB_PATH);
+  if (!_db) {
+    if (lastError instanceof Error) {
+      throw lastError;
+    }
+    throw new Error("Failed to open SQLite database");
+  }
+
   _db.pragma("journal_mode = WAL");
   _db.pragma("foreign_keys = ON");
 
