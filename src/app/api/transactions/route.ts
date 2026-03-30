@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getTransactionsBetween } from "@/lib/etherscan";
+import { getRelationship } from "@/lib/etherscan";
 
 export async function GET(request: Request): Promise<NextResponse> {
   const { searchParams } = new URL(request.url);
@@ -21,7 +21,7 @@ export async function GET(request: Request): Promise<NextResponse> {
   }
 
   try {
-    const summary = await getTransactionsBetween(addressA, addressB);
+    const summary = await getRelationship(addressA, addressB);
     return NextResponse.json(summary);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
