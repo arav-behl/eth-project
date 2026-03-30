@@ -1,14 +1,23 @@
 import { JsonRpcProvider, formatEther } from "ethers";
 
 const RPC_ENDPOINTS = [
-  "https://eth.llamarpc.com",
   "https://cloudflare-eth.com",
   "https://ethereum-rpc.publicnode.com",
   "https://1rpc.io/eth",
+  "https://rpc.ankr.com/eth",
 ];
 
-function createProvider(): JsonRpcProvider {
-  return new JsonRpcProvider(RPC_ENDPOINTS[0]);
+async function createProvider(): Promise<JsonRpcProvider> {
+  for (const url of RPC_ENDPOINTS) {
+    const provider = new JsonRpcProvider(url);
+    try {
+      await provider.getBlockNumber();
+      return provider;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("All RPC endpoints are unavailable");
 }
 
 const TEXT_RECORD_KEYS = [
@@ -49,7 +58,7 @@ export interface ENSProfile {
 }
 
 export async function resolveENS(ensName: string): Promise<ENSProfile> {
-  const provider = createProvider();
+  const provider = await createProvider();
 
   const address = await provider.resolveName(ensName);
   if (!address) {
