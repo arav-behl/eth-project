@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, type FormEvent } from "react";
+import { useState, useCallback, useRef, type FormEvent, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import type { ENSProfile } from "@/lib/ens";
 import { NetworkGraph, type GraphNode, type GraphEdge } from "@/components/NetworkGraph";
@@ -8,11 +8,29 @@ import { FriendshipsPanel } from "@/components/FriendshipsPanel";
 
 const SUGGESTIONS = ["vitalik.eth", "nick.eth", "brantly.eth", "sassal.eth"];
 
-interface TxSummary {
-  txCount: number;
+interface RelationshipResponse {
+  directTxCount: number;
   totalValueEth: string;
   lastTxTimestamp: number | null;
-  types: string[];
+  aToB: number;
+  bToA: number;
+  sharedTokens: string[];
+  sharedContracts: number;
+  sharedContractDetails: Array<{
+    address: string;
+    label: string;
+  }>;
+  recentInteractions: Array<{
+    hash: string;
+    timestamp: number | null;
+    kind: "native" | "token";
+    from: string | null;
+    to: string | null;
+    value: string;
+    asset: string;
+  }>;
+  strength: number;
+  label: string;
 }
 
 interface FriendshipRecord {
@@ -20,6 +38,36 @@ interface FriendshipRecord {
   ens_a: string;
   ens_b: string;
   created_at: string;
+}
+
+function buildEdgeKey(source: string, target: string): string {
+  return [source, target].sort().join("::");
+}
+
+function shortenAddress(address: string | null): string {
+  if (!address) return "";
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function formatTimestamp(timestamp: number | null): string {
+  if (!timestamp) return "Unknown";
+  return new Date(timestamp * 1000).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function chooseSelectedEdge(nextEdges: GraphEdge[], currentEdgeKey: string | null): string | null {
+  if (currentEdgeKey && nextEdges.some((edge) => buildEdgeKey(edge.source, edge.target) === currentEdgeKey)) {
+    return currentEdgeKey;
+  }
+
+  const strongest = [...nextEdges]
+    .filter((edge) => edge.strength > 0)
+    .sort((left, right) => right.strength - left.strength || right.directTxCount - left.directTxCount)[0];
+
+  return strongest ? buildEdgeKey(strongest.source, strongest.target) : null;
 }
 
 export default function GraphPage() {
@@ -30,11 +78,17 @@ export default function GraphPage() {
   const [loading, setLoading] = useState<string | null>(null);
   const [txLoading, setTxLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Walla-Walla specific
+  const [selectedEdgeKey, setSelectedEdgeKey] = useState<string | null>(null);
+
+  // Tacoma specific (Friendships)
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedNodes, setSelectedNodes] = useState<string[]>([]);
   const [friendshipLoading, setFriendshipLoading] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+
   const nodesRef = useRef<GraphNode[]>([]);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -44,16 +98,30 @@ export default function GraphPage() {
     toastTimerRef.current = setTimeout(() => setToast(null), 4000);
   }, []);
 
-  const fetchTransactions = useCallback(
-    async (addressA: string, addressB: string): Promise<TxSummary> => {
+  const fetchRelationship = useCallback(
+    async (addressA: string, addressB: string): Promise<RelationshipResponse> => {
+      const empty: RelationshipResponse = {
+        directTxCount: 0,
+        totalValueEth: "0",
+        lastTxTimestamp: null,
+        aToB: 0,
+        bToA: 0,
+        sharedTokens: [],
+        sharedContracts: 0,
+        sharedContractDetails: [],
+        recentInteractions: [],
+        strength: 0,
+        label: "no on-chain link",
+      };
+
       try {
         const res = await fetch(
           `/api/transactions?a=${encodeURIComponent(addressA)}&b=${encodeURIComponent(addressB)}`
         );
-        if (!res.ok) return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
+        if (!res.ok) return empty;
         return await res.json();
       } catch {
-        return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
+        return empty;
       }
     },
     []
@@ -81,15 +149,25 @@ export default function GraphPage() {
         .map((f) => ({
           source: f.ens_a,
           target: f.ens_b,
-          txCount: 0,
+          directTxCount: 0,
           totalValueEth: "0",
           lastTxTimestamp: null,
-          types: [],
+          sharedTokens: [],
+          sharedContracts: 0,
+          sharedContractDetails: [],
+          recentInteractions: [],
+          strength: 0,
+          label: "manual friendship",
           edgeType: "friendship" as const,
         }));
       return [...nonFriendship, ...friendshipEdges];
     });
   }, [fetchFriendships]);
+  
+  // Refresh on mount just in case
+  useEffect(() => {
+    refreshFriendshipEdges();
+  }, [refreshFriendshipEdges]);
 
   const addNode = useCallback(
     async (rawInput: string) => {
@@ -97,7 +175,7 @@ export default function GraphPage() {
       if (!name) return;
       const ensName = name.endsWith(".eth") ? name : `${name}.eth`;
 
-      if (nodesRef.current.some((n) => n.ensName === ensName)) {
+      if (nodesRef.current.some((node) => node.ensName === ensName)) {
         setError(`${ensName} is already in the graph`);
         return;
       }
@@ -132,48 +210,56 @@ export default function GraphPage() {
         nodesRef.current = [...existingNodes, newNode];
         setNodes(nodesRef.current);
 
-        // Fetch transaction data between new node and all existing nodes
         if (existingNodes.length > 0) {
           setTxLoading(true);
-          const txResults = await Promise.all(
+          const results = await Promise.all(
             existingNodes
-              .filter((n) => n.address)
+              .filter((node) => node.address)
               .map(async (existing) => {
-                const summary = await fetchTransactions(
-                  newNode.address!,
-                  existing.address!
-                );
+                const rel = await fetchRelationship(newNode.address!, existing.address!);
                 return {
                   source: existing.id,
                   target: newNode.id,
-                  txCount: summary.txCount,
-                  totalValueEth: summary.totalValueEth,
-                  lastTxTimestamp: summary.lastTxTimestamp,
-                  types: summary.types,
+                  directTxCount: rel.directTxCount,
+                  totalValueEth: rel.totalValueEth,
+                  lastTxTimestamp: rel.lastTxTimestamp,
+                  sharedTokens: rel.sharedTokens,
+                  sharedContracts: rel.sharedContracts,
+                  sharedContractDetails: rel.sharedContractDetails,
+                  recentInteractions: rel.recentInteractions,
+                  strength: rel.strength,
+                  label: rel.label,
                   edgeType: "inferred" as const,
-                };
+                } satisfies GraphEdge;
               })
           );
 
-          setEdges((prev) => [...prev, ...txResults]);
+          setEdges((prev) => {
+            const nextEdges = [...prev, ...results];
+            setSelectedEdgeKey((current) => chooseSelectedEdge(nextEdges, current));
+            return nextEdges;
+          });
           setTxLoading(false);
+          
+          await refreshFriendshipEdges();
         }
-
-        // Refresh friendship edges after adding a node
-        await refreshFriendshipEdges();
       } catch {
         setError(`Network error resolving ${ensName}`);
       } finally {
         setLoading(null);
       }
     },
-    [fetchTransactions, refreshFriendshipEdges]
+    [fetchRelationship, refreshFriendshipEdges]
   );
 
   const removeNode = useCallback((ensName: string) => {
-    nodesRef.current = nodesRef.current.filter((n) => n.ensName !== ensName);
+    nodesRef.current = nodesRef.current.filter((node) => node.ensName !== ensName);
     setNodes(nodesRef.current);
-    setEdges((prev) => prev.filter((e) => e.source !== ensName && e.target !== ensName));
+    setEdges((prev) => {
+      const nextEdges = prev.filter((edge) => edge.source !== ensName && edge.target !== ensName);
+      setSelectedEdgeKey((current) => chooseSelectedEdge(nextEdges, current));
+      return nextEdges;
+    });
     setSelectedNodes((prev) => prev.filter((n) => n !== ensName));
   }, []);
 
@@ -260,24 +346,24 @@ export default function GraphPage() {
           ens_b: ensB,
           address_a: nodeA?.address,
           address_b: nodeB?.address,
-          avatar_a: nodeA?.avatar,
-          avatar_b: nodeB?.avatar,
-          display_name_a: nodeA?.displayName,
-          display_name_b: nodeB?.displayName,
         }),
       });
 
       if (res.ok || res.status === 201) {
-        // Add edge optimistically
         setEdges((prev) => [
           ...prev,
           {
             source: ensA,
             target: ensB,
-            txCount: 0,
+            directTxCount: 0,
             totalValueEth: "0",
             lastTxTimestamp: null,
-            types: [],
+            sharedTokens: [],
+            sharedContracts: 0,
+            sharedContractDetails: [],
+            recentInteractions: [],
+            strength: 0,
+            label: "manual friendship",
             edgeType: "friendship" as const,
           },
         ]);
@@ -301,11 +387,27 @@ export default function GraphPage() {
   }, []);
 
   const friendshipCount = edges.filter((e) => e.edgeType === "friendship").length;
-  const inferredCount = edges.filter((e) => e.edgeType === "inferred" && e.txCount > 0).length;
+
+  const strongEdges = [...edges]
+    .filter((edge) => edge.strength > 0 || edge.edgeType === "friendship")
+    .sort((left, right) => {
+      // Prioritize explicit friendships slightly
+      if (left.edgeType === "friendship" && right.edgeType !== "friendship") return -1;
+      if (right.edgeType === "friendship" && left.edgeType !== "friendship") return 1;
+      return right.strength - left.strength || right.directTxCount - left.directTxCount;
+    });
+
+  const selectedEdge =
+    edges.find((edge) => buildEdgeKey(edge.source, edge.target) === selectedEdgeKey) ?? strongEdges[0] ?? null;
+  const selectedSource = selectedEdge
+    ? nodes.find((node) => node.id === selectedEdge.source) ?? null
+    : null;
+  const selectedTarget = selectedEdge
+    ? nodes.find((node) => node.id === selectedEdge.target) ?? null
+    : null;
 
   return (
-    <main className="flex flex-col h-screen px-4 py-5 max-w-[1400px] mx-auto w-full">
-      {/* Header */}
+    <main className="flex flex-col h-screen px-4 py-5 max-w-[1600px] mx-auto w-full">
       <header className="flex items-center justify-between mb-5 flex-shrink-0">
         <button
           onClick={() => router.push("/")}
@@ -317,7 +419,6 @@ export default function GraphPage() {
           <h1 className="text-xl font-bold bg-gradient-to-r from-accent-purple via-accent-blue to-accent-green bg-clip-text text-transparent">
             Social Graph
           </h1>
-          {/* Manage Friendships button */}
           <button
             id="manage-friendships-btn"
             onClick={() => setPanelOpen(true)}
@@ -339,7 +440,6 @@ export default function GraphPage() {
         </div>
       </header>
 
-      {/* Input */}
       <div className="flex-shrink-0 mb-4">
         <form onSubmit={handleSubmit}>
           <div className="relative group">
@@ -363,7 +463,7 @@ export default function GraphPage() {
                 disabled={!!loading || !input.trim()}
                 className="m-1.5 px-5 py-2 bg-gradient-to-r from-accent-purple to-accent-blue rounded-lg text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-30 disabled:cursor-not-allowed"
               >
-                {loading ? "Resolving\u2026" : "Add"}
+                {loading ? "Resolving..." : "Add"}
               </button>
             </div>
           </div>
@@ -372,7 +472,6 @@ export default function GraphPage() {
         {error && <p className="text-red-400/90 text-xs mt-2 ml-1">{error}</p>}
       </div>
 
-      {/* Suggestions when empty */}
       {nodes.length === 0 && !loading && (
         <div className="flex flex-wrap items-center gap-2 mb-4 flex-shrink-0">
           <span className="text-gray-600 text-xs">Try adding:</span>
@@ -388,136 +487,128 @@ export default function GraphPage() {
         </div>
       )}
 
-      {/* Name chips + Friendship controls */}
       {(nodes.length > 0 || loading) && (
-        <div className="flex flex-wrap items-center gap-2 mb-4 flex-shrink-0">
-          {nodes.map((node) => (
-            <div
-              key={node.ensName}
-              className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] rounded-full pl-1.5 pr-2.5 py-1 hover:bg-white/[0.07] transition-colors group"
-            >
-              {node.avatar ? (
-                <img
-                  src={node.avatar}
-                  alt=""
-                  className="w-5 h-5 rounded-full object-cover"
-                />
-              ) : (
-                <div className="w-5 h-5 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-[10px] font-bold text-white">
-                  {node.ensName.charAt(0).toUpperCase()}
-                </div>
-              )}
-              <span className="text-xs text-gray-300">{node.displayName}</span>
-              <button
-                onClick={() => removeNode(node.ensName)}
-                className="text-gray-600 hover:text-red-400 transition-colors"
+        <div className="flex items-start justify-between gap-4 mb-4 flex-shrink-0">
+          <div className="flex flex-wrap gap-2 min-w-0">
+            {nodes.map((node) => (
+              <div
+                key={node.ensName}
+                className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] rounded-full pl-1.5 pr-2.5 py-1 hover:bg-white/[0.07] transition-colors group"
               >
-                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  <path d="M18 6L6 18M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-          ))}
-
-          {loading && (
-            <div className="flex items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1 animate-pulse">
-              <div className="w-5 h-5 rounded-full bg-white/10" />
-              <span className="text-xs text-gray-500">{loading}</span>
-            </div>
-          )}
-
-          {/* Friendship action buttons */}
-          {nodes.length >= 2 && (
-            <div className="ml-auto flex items-center gap-2">
-              {!selectionMode ? (
+                {node.avatar ? (
+                  <img src={node.avatar} alt="" className="w-5 h-5 rounded-full object-cover" />
+                ) : (
+                  <div className="w-5 h-5 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-[10px] font-bold text-white">
+                    {node.ensName.charAt(0).toUpperCase()}
+                  </div>
+                )}
+                <span className="text-xs text-gray-300">{node.displayName}</span>
                 <button
-                  onClick={() => {
-                    setSelectionMode(true);
-                    setSelectedNodes([]);
-                    setError(null);
-                  }}
-                  className="px-3 py-1.5 bg-gradient-to-r from-amber-500/20 to-red-500/20 hover:from-amber-500/30 hover:to-red-500/30 border border-amber-500/30 rounded-lg text-xs text-amber-300 font-medium transition-all"
+                  onClick={() => removeNode(node.ensName)}
+                  className="text-gray-600 hover:text-red-400 transition-colors"
                 >
-                  + Add Friendship
+                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
                 </button>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-amber-400/80">
-                    {selectedNodes.length === 0
-                      ? "Select first node"
-                      : selectedNodes.length === 1
-                        ? "Select second node"
-                        : "Ready to connect"}
-                  </span>
-                  {selectedNodes.length === 2 && (
-                    <button
-                      onClick={addFriendship}
-                      disabled={friendshipLoading}
-                      className="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-red-500 rounded-lg text-xs text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
-                    >
-                      {friendshipLoading ? "Saving\u2026" : "Confirm"}
-                    </button>
-                  )}
+              </div>
+            ))}
+
+            {loading && (
+              <div className="flex items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1 animate-pulse">
+                <div className="w-5 h-5 rounded-full bg-white/10" />
+                <span className="text-xs text-gray-500">{loading}</span>
+              </div>
+            )}
+
+            {nodes.length >= 2 && (
+              <div className="ml-auto flex items-center gap-2">
+                {!selectionMode ? (
                   <button
-                    onClick={cancelSelection}
-                    className="px-2 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs text-gray-400 transition-colors"
+                    onClick={() => {
+                      setSelectionMode(true);
+                      setSelectedNodes([]);
+                      setError(null);
+                    }}
+                    className="px-3 py-1.5 bg-gradient-to-r from-amber-500/20 to-red-500/20 hover:from-amber-500/30 hover:to-red-500/30 border border-amber-500/30 rounded-lg text-xs text-amber-300 font-medium transition-all"
                   >
-                    Cancel
+                    + Add Friendship
                   </button>
-                </div>
-              )}
-            </div>
-          )}
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-amber-400/80">
+                      {selectedNodes.length === 0
+                        ? "Select first node"
+                        : selectedNodes.length === 1
+                          ? "Select second node"
+                          : "Ready to connect"}
+                    </span>
+                    {selectedNodes.length === 2 && (
+                      <button
+                        onClick={addFriendship}
+                        disabled={friendshipLoading}
+                        className="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-red-500 rounded-lg text-xs text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
+                      >
+                        {friendshipLoading ? "Saving..." : "Confirm"}
+                      </button>
+                    )}
+                    <button
+                      onClick={cancelSelection}
+                      className="px-2 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs text-gray-400 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
-      {/* Graph */}
-      <div className="flex-1 min-h-0 relative">
-        <NetworkGraph
+      <div className="flex-1 min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4">
+        <div className="min-h-[420px] xl:min-h-0 relative">
+          <NetworkGraph
+            nodes={nodes}
+            edges={edges}
+            onNodeClick={handleNodeClick}
+            selectedNodes={selectedNodes}
+            onNodeSelect={handleNodeSelect}
+            onEdgeClick={handleEdgeClick}
+            selectionMode={selectionMode}
+            onEdgeSelect={(edge) => setSelectedEdgeKey(buildEdgeKey(edge.source, edge.target))}
+            selectedEdgeKey={selectedEdge ? buildEdgeKey(selectedEdge.source, selectedEdge.target) : null}
+          />
+          {txLoading && (
+            <div className="absolute top-3 right-3 flex items-center gap-2 bg-dark-100/90 border border-white/10 rounded-lg px-3 py-1.5 backdrop-blur-sm">
+              <div className="w-3 h-3 border-2 border-accent-purple/40 border-t-accent-purple rounded-full animate-spin" />
+              <span className="text-xs text-gray-400">Analyzing on-chain relationships...</span>
+            </div>
+          )}
+          {friendshipLoading && (
+            <div className="absolute top-3 left-3 flex items-center gap-2 bg-dark-100/90 border border-amber-500/20 rounded-lg px-3 py-1.5 backdrop-blur-sm">
+              <div className="w-3 h-3 border-2 border-amber-500/40 border-t-amber-500 rounded-full animate-spin" />
+              <span className="text-xs text-amber-400/80">Updating friendships...</span>
+            </div>
+          )}
+        </div>
+
+        <RelationshipSidebar
           nodes={nodes}
-          edges={edges}
-          onNodeClick={handleNodeClick}
-          selectedNodes={selectedNodes}
-          onNodeSelect={handleNodeSelect}
-          onEdgeClick={handleEdgeClick}
-          selectionMode={selectionMode}
+          edges={strongEdges}
+          selectedEdge={selectedEdge}
+          selectedSource={selectedSource}
+          selectedTarget={selectedTarget}
+          onSelectEdge={(edge) => setSelectedEdgeKey(buildEdgeKey(edge.source, edge.target))}
         />
-        {txLoading && (
-          <div className="absolute top-3 right-3 flex items-center gap-2 bg-dark-100/90 border border-white/10 rounded-lg px-3 py-1.5 backdrop-blur-sm">
-            <div className="w-3 h-3 border-2 border-accent-purple/40 border-t-accent-purple rounded-full animate-spin" />
-            <span className="text-xs text-gray-400">Checking on-chain transactions...</span>
-          </div>
-        )}
-        {friendshipLoading && (
-          <div className="absolute top-3 left-3 flex items-center gap-2 bg-dark-100/90 border border-amber-500/20 rounded-lg px-3 py-1.5 backdrop-blur-sm">
-            <div className="w-3 h-3 border-2 border-amber-500/40 border-t-amber-500 rounded-full animate-spin" />
-            <span className="text-xs text-amber-400/80">Updating friendships...</span>
-          </div>
-        )}
       </div>
 
-      {/* Legend + Footer */}
       {nodes.length > 0 && (
-        <div className="flex items-center justify-center gap-6 mt-2 flex-shrink-0">
-          {inferredCount > 0 && (
-            <div className="flex items-center gap-1.5">
-              <div className="w-6 h-0.5 bg-gradient-to-r from-accent-purple to-accent-green rounded" />
-              <span className="text-[10px] text-gray-500">On-chain transactions</span>
-            </div>
-          )}
-          {friendshipCount > 0 && (
-            <div className="flex items-center gap-1.5">
-              <div className="w-6 h-0.5 bg-gradient-to-r from-amber-500 to-red-500 rounded" />
-              <span className="text-[10px] text-gray-500">Manual friendships ({friendshipCount})</span>
-            </div>
-          )}
-          <span className="text-[10px] text-gray-600">
-            Drag nodes &middot; Scroll to zoom &middot; Click node to view profile &middot; Click friendship edge to remove
-          </span>
-        </div>
+        <p className="text-center text-gray-600 text-[10px] mt-2 flex-shrink-0">
+          Drag nodes to rearrange · Scroll to zoom · Click a node to open its profile · Click a link to inspect the relationship
+        </p>
       )}
 
-      {/* Friendships Panel */}
       <FriendshipsPanel
         isOpen={panelOpen}
         onClose={() => setPanelOpen(false)}
@@ -525,7 +616,6 @@ export default function GraphPage() {
         onFriendshipsChanged={refreshFriendshipEdges}
       />
 
-      {/* Toast notification */}
       {toast && (
         <div
           className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-2.5 px-4 py-2.5 rounded-xl border backdrop-blur-xl shadow-2xl shadow-black/40 animate-[slideUp_0.3s_ease-out] ${
@@ -556,5 +646,237 @@ export default function GraphPage() {
         </div>
       )}
     </main>
+  );
+}
+
+function RelationshipSidebar({
+  nodes,
+  edges,
+  selectedEdge,
+  selectedSource,
+  selectedTarget,
+  onSelectEdge,
+}: {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  selectedEdge: GraphEdge | null;
+  selectedSource: GraphNode | null;
+  selectedTarget: GraphNode | null;
+  onSelectEdge: (edge: GraphEdge) => void;
+}) {
+  return (
+    <aside className="min-h-[320px] xl:min-h-0 rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-sm overflow-hidden flex flex-col">
+      <div className="p-4 border-b border-white/8 shrink-0">
+        <div className="text-[11px] uppercase tracking-[0.2em] text-gray-500 mb-2">Relationship Inspector</div>
+        {selectedEdge && selectedSource && selectedTarget ? (
+          <>
+            <div className="flex items-center justify-between gap-3">
+              <IdentityBadge node={selectedSource} />
+              <div className="text-gray-600 text-xs">↔</div>
+              <IdentityBadge node={selectedTarget} align="right" />
+            </div>
+            
+            {selectedEdge.edgeType === "friendship" && (
+                <div className="mt-3 inline-flex items-center gap-1.5 px-2 py-1 rounded bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[10px] font-medium tracking-wide">
+                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                    <circle cx="9" cy="7" r="4" />
+                    <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                  </svg>
+                  MANUAL FRIENDSHIP
+                </div>
+            )}
+            
+            <p className="text-xs text-gray-400 mt-3 leading-relaxed">{selectedEdge.label}</p>
+            
+            <div className="grid grid-cols-2 gap-2 mt-4">
+              <MetricCard label="Interactions" value={String(selectedEdge.directTxCount)} />
+              <MetricCard label="Shared Contracts" value={String(selectedEdge.sharedContracts)} />
+              <MetricCard label="ETH Value" value={selectedEdge.totalValueEth} />
+              <MetricCard label="Last Seen" value={formatTimestamp(selectedEdge.lastTxTimestamp)} />
+            </div>
+          </>
+        ) : (
+          <p className="text-sm text-gray-400 leading-relaxed">
+            Add at least two ENS names, then click a link in the graph. The details move here so the canvas stays readable.
+          </p>
+        )}
+      </div>
+
+      <div className="p-4 space-y-5 overflow-y-auto max-h-[calc(100vh-290px)] xl:max-h-full flex-1">
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-sm font-semibold text-white">Connections in Graph</h2>
+            <span className="text-[11px] text-gray-500">{edges.length}</span>
+          </div>
+          <div className="space-y-2">
+            {edges.length > 0 ? (
+              edges.map((edge) => {
+                const source = nodes.find((node) => node.id === edge.source);
+                const target = nodes.find((node) => node.id === edge.target);
+                if (!source || !target) return null;
+
+                const isFriendship = edge.edgeType === "friendship";
+
+                return (
+                  <button
+                    key={buildEdgeKey(edge.source, edge.target)}
+                    onClick={() => onSelectEdge(edge)}
+                    className={`w-full rounded-xl border px-3 py-2 text-left transition-colors ${
+                      selectedEdge && buildEdgeKey(selectedEdge.source, selectedEdge.target) === buildEdgeKey(edge.source, edge.target)
+                        ? "border-accent-blue/60 bg-accent-blue/10"
+                        : "border-white/8 bg-white/[0.02] hover:bg-white/[0.05]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-xs font-medium text-white flex items-center gap-1.5 flex-wrap">
+                        {source.displayName} · {target.displayName}
+                        {isFriendship && (
+                          <div className="w-2 h-2 rounded-full bg-amber-500" title="Friendship" />
+                        )}
+                      </div>
+                      <div className="text-[11px] text-accent-blue min-w-[30px] text-right">{edge.directTxCount} tx</div>
+                    </div>
+                    <div className="text-[11px] text-gray-500 mt-1 line-clamp-2">{edge.label}</div>
+                  </button>
+                );
+              })
+            ) : (
+              <div className="rounded-xl border border-dashed border-white/10 px-3 py-4 text-xs text-gray-500">
+                No relationships detected yet.
+              </div>
+            )}
+          </div>
+        </div>
+
+        {selectedEdge && (
+          <>
+            <SidebarSection title="Recent Interactions">
+              {selectedEdge.recentInteractions.length > 0 ? (
+                selectedEdge.recentInteractions.map((interaction) => (
+                  <div
+                    key={`${interaction.hash}-${interaction.kind}-${interaction.asset}`}
+                    className="rounded-xl border border-white/8 bg-black/20 px-3 py-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-medium text-white">
+                        {interaction.value} {interaction.asset}
+                      </span>
+                      <span className="text-[11px] uppercase tracking-wide text-gray-500">{interaction.kind}</span>
+                    </div>
+                    <div className="text-[11px] text-gray-400 mt-1">
+                      {shortenAddress(interaction.from)} → {shortenAddress(interaction.to)}
+                    </div>
+                    <div className="text-[11px] text-gray-500 mt-1">{formatTimestamp(interaction.timestamp)}</div>
+                  </div>
+                ))
+              ) : (
+                <EmptySidebarState text={selectedEdge.edgeType === "friendship" ? "No on-chain interactions recorded for this friendship yet." : "No direct transfers captured for this pair."} />
+              )}
+            </SidebarSection>
+
+            <SidebarSection title="Shared Tokens">
+              {selectedEdge.sharedTokens.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {selectedEdge.sharedTokens.map((token) => (
+                    <span
+                      key={token}
+                      className="rounded-full border border-accent-purple/30 bg-accent-purple/10 px-2.5 py-1 text-[11px] text-accent-purple"
+                    >
+                      {token}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <EmptySidebarState text="No overlapping token contracts found." />
+              )}
+            </SidebarSection>
+
+            <SidebarSection title="Shared Contracts">
+              {selectedEdge.sharedContractDetails.length > 0 ? (
+                selectedEdge.sharedContractDetails.map((contract) => (
+                  <div
+                    key={contract.address}
+                    className="flex items-center justify-between gap-3 rounded-xl border border-white/8 bg-black/20 px-3 py-2"
+                  >
+                    <div>
+                      <div className="text-xs font-medium text-white">{contract.label}</div>
+                      <div className="text-[11px] text-gray-500 font-mono">{shortenAddress(contract.address)}</div>
+                    </div>
+                    <a
+                      href={`https://eth.blockscout.com/address/${contract.address}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[11px] text-accent-blue hover:text-white transition-colors"
+                    >
+                      open
+                    </a>
+                  </div>
+                ))
+              ) : (
+                <EmptySidebarState text="No shared contracts detected for this relationship." />
+              )}
+            </SidebarSection>
+          </>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function IdentityBadge({
+  node,
+  align = "left",
+}: {
+  node: GraphNode;
+  align?: "left" | "right";
+}) {
+  return (
+    <div className={`flex items-center gap-2 min-w-0 ${align === "right" ? "text-right flex-row-reverse" : ""}`}>
+      {node.avatar ? (
+        <img src={node.avatar} alt="" className="w-10 h-10 rounded-full object-cover border border-white/10" />
+      ) : (
+        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-sm font-bold text-white border border-white/10">
+          {node.ensName.charAt(0).toUpperCase()}
+        </div>
+      )}
+      <div className="min-w-0">
+        <div className="text-sm font-semibold text-white truncate">{node.displayName}</div>
+        <div className="text-[11px] text-gray-500 font-mono truncate">{shortenAddress(node.address)}</div>
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-white/8 bg-black/20 px-3 py-2">
+      <div className="text-[11px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="text-sm font-semibold text-white mt-1">{value}</div>
+    </div>
+  );
+}
+
+function SidebarSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section>
+      <h3 className="text-sm font-semibold text-white mb-2">{title}</h3>
+      <div className="space-y-2">{children}</div>
+    </section>
+  );
+}
+
+function EmptySidebarState({ text }: { text: string }) {
+  return (
+    <div className="rounded-xl border border-dashed border-white/10 px-3 py-4 text-xs text-gray-500">
+      {text}
+    </div>
   );
 }
