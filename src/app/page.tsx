@@ -78,6 +78,26 @@ export default function Home() {
             </button>
           ))}
         </div>
+
+        <div className="mt-8">
+          <button
+            onClick={() => router.push("/graph")}
+            className="mx-auto flex items-center gap-2.5 px-5 py-2.5 bg-white/[0.03] hover:bg-white/[0.07] border border-white/10 rounded-xl text-sm text-gray-400 hover:text-white transition-all"
+          >
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <circle cx="12" cy="12" r="2.5" />
+              <circle cx="4.5" cy="7" r="1.8" />
+              <circle cx="19.5" cy="7" r="1.8" />
+              <circle cx="4.5" cy="17" r="1.8" />
+              <circle cx="19.5" cy="17" r="1.8" />
+              <line x1="6.2" y1="7.8" x2="9.8" y2="10.8" opacity="0.5" />
+              <line x1="17.8" y1="7.8" x2="14.2" y2="10.8" opacity="0.5" />
+              <line x1="6.2" y1="16.2" x2="9.8" y2="13.2" opacity="0.5" />
+              <line x1="17.8" y1="16.2" x2="14.2" y2="13.2" opacity="0.5" />
+            </svg>
+            Build Social Graph
+          </button>
+        </div>
       </div>
     </main>
   );
