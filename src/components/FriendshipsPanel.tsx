@@ -471,7 +471,7 @@ export function FriendshipsPanel({
           {/* Footer */}
           <div className="flex-shrink-0 px-5 py-3 border-t border-white/[0.06]">
             <p className="text-[10px] text-gray-600 text-center">
-              Friendships are stored in PostgreSQL via Django · Changes sync with the graph in real-time
+              Friendships are stored in the database · Changes sync with the graph in real-time
             </p>
           </div>
         </div>

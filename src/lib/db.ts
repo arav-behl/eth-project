@@ -2,7 +2,10 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 
-const DB_PATH = path.join(process.cwd(), "data", "ens-explorer.db");
+// On Vercel, process.cwd() (/var/task) is read-only; only /tmp is writable
+const DB_PATH = process.env.VERCEL
+  ? path.join("/tmp", "ens-explorer.db")
+  : path.join(process.cwd(), "data", "ens-explorer.db");
 
 let _db: Database.Database | null = null;
 
