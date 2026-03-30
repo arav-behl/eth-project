@@ -31,6 +31,10 @@ export interface GraphNode {
 export interface GraphEdge {
   source: string;
   target: string;
+  txCount: number;
+  totalValueEth: string;
+  lastTxTimestamp: number | null;
+  types: string[]; // e.g. ["eth", "erc20", "internal"]
 }
 
 interface SimNode extends SimulationNodeDatum {
@@ -79,6 +83,7 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
   const dragRef = useRef<{ nodeId: string; didMove: boolean } | null>(null);
+  const lastDragDidMoveRef = useRef(false);
   const panRef = useRef<{
     startX: number;
     startY: number;
@@ -225,6 +230,8 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
   const handleNodePointerUp = useCallback(() => {
     if (!dragRef.current) return;
 
+    lastDragDidMoveRef.current = dragRef.current.didMove;
+
     const node = simNodesRef.current.find((n) => n.id === dragRef.current!.nodeId);
     if (node) {
       node.fx = null;
@@ -343,23 +350,76 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
             {simLinksRef.current.map((link, i) => {
               const s = getSimNode(link, "source");
               const t = getSimNode(link, "target");
-              if (!s?.x || !t?.x) return null;
+              if (!s?.x || !t?.x || !s?.y || !t?.y) return null;
 
               const edgeConnected =
                 !hoveredNode || (connectedSet.has(getSourceId(link)) && connectedSet.has(getTargetId(link)));
 
+              const matchingEdge = edges.find(
+                (e) =>
+                  (e.source === getSourceId(link) && e.target === getTargetId(link)) ||
+                  (e.source === getTargetId(link) && e.target === getSourceId(link))
+              );
+              const hasTx = matchingEdge && matchingEdge.txCount > 0;
+              const midX = (s.x + t.x) / 2;
+              const midY = (s.y + t.y) / 2;
+
               return (
-                <line
-                  key={`e-${i}`}
-                  x1={s.x}
-                  y1={s.y}
-                  x2={t.x}
-                  y2={t.y}
-                  stroke={`url(#eg-${i})`}
-                  strokeWidth={hoveredNode && edgeConnected ? 2.5 : 1.5}
-                  opacity={hoveredNode ? (edgeConnected ? 0.9 : 0.06) : 0.35}
-                  style={{ transition: "opacity 0.3s, stroke-width 0.3s" }}
-                />
+                <g key={`e-${i}`}>
+                  <line
+                    x1={s.x}
+                    y1={s.y}
+                    x2={t.x}
+                    y2={t.y}
+                    stroke={hasTx ? `url(#eg-${i})` : "#374151"}
+                    strokeWidth={hasTx ? (hoveredNode && edgeConnected ? 3 : 2) : 1}
+                    strokeDasharray={hasTx ? undefined : "4 4"}
+                    opacity={hoveredNode ? (edgeConnected ? 0.9 : 0.06) : hasTx ? 0.5 : 0.15}
+                    style={{ transition: "opacity 0.3s, stroke-width 0.3s" }}
+                  />
+
+                  {/* Edge label */}
+                  {hasTx && (
+                    <g
+                      transform={`translate(${midX},${midY})`}
+                      opacity={hoveredNode ? (edgeConnected ? 1 : 0.06) : 0.85}
+                      style={{ transition: "opacity 0.3s" }}
+                    >
+                      <rect
+                        x="-42"
+                        y="-18"
+                        width="84"
+                        height="36"
+                        rx="10"
+                        fill="#1e2028"
+                        stroke="#374151"
+                        strokeWidth="0.5"
+                        opacity="0.95"
+                      />
+                      <text
+                        textAnchor="middle"
+                        y="-4"
+                        fill="#d1d5db"
+                        fontSize="9"
+                        fontWeight="600"
+                        style={{ pointerEvents: "none", userSelect: "none" }}
+                      >
+                        {matchingEdge.txCount} tx
+                      </text>
+                      <text
+                        textAnchor="middle"
+                        y="10"
+                        fill="#6b7280"
+                        fontSize="7"
+                        style={{ pointerEvents: "none", userSelect: "none" }}
+                      >
+                        {parseFloat(matchingEdge.totalValueEth) > 0
+                          ? `${parseFloat(matchingEdge.totalValueEth).toFixed(2)} ETH`
+                          : matchingEdge.types.includes("erc20") ? "token transfers" : "contract calls"}
+                      </text>
+                    </g>
+                  )}
+                </g>
               );
             })}
 
@@ -386,7 +446,8 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
                   onClick={() => {
-                    if (!dragRef.current?.didMove) onNodeClick(node.ensName);
+                    if (!lastDragDidMoveRef.current) onNodeClick(node.ensName);
+                    lastDragDidMoveRef.current = false;
                   }}
                 >
                   {/* Glow ring on hover */}

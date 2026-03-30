@@ -1,11 +1,18 @@
 "use client";
 
-import { useState, useCallback, type FormEvent } from "react";
+import { useState, useCallback, useRef, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import type { ENSProfile } from "@/lib/ens";
 import { NetworkGraph, type GraphNode, type GraphEdge } from "@/components/NetworkGraph";
 
 const SUGGESTIONS = ["vitalik.eth", "nick.eth", "brantly.eth", "sassal.eth"];
+
+interface TxSummary {
+  txCount: number;
+  totalValueEth: string;
+  lastTxTimestamp: number | null;
+  types: string[];
+}
 
 export default function GraphPage() {
   const router = useRouter();
@@ -13,7 +20,24 @@ export default function GraphPage() {
   const [nodes, setNodes] = useState<GraphNode[]>([]);
   const [edges, setEdges] = useState<GraphEdge[]>([]);
   const [loading, setLoading] = useState<string | null>(null);
+  const [txLoading, setTxLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const nodesRef = useRef<GraphNode[]>([]);
+
+  const fetchTransactions = useCallback(
+    async (addressA: string, addressB: string): Promise<TxSummary> => {
+      try {
+        const res = await fetch(
+          `/api/transactions?a=${encodeURIComponent(addressA)}&b=${encodeURIComponent(addressB)}`
+        );
+        if (!res.ok) return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
+        return await res.json();
+      } catch {
+        return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
+      }
+    },
+    []
+  );
 
   const addNode = useCallback(
     async (rawInput: string) => {
@@ -21,7 +45,7 @@ export default function GraphPage() {
       if (!name) return;
       const ensName = name.endsWith(".eth") ? name : `${name}.eth`;
 
-      if (nodes.some((n) => n.ensName === ensName)) {
+      if (nodesRef.current.some((n) => n.ensName === ensName)) {
         setError(`${ensName} is already in the graph`);
         return;
       }
@@ -38,6 +62,11 @@ export default function GraphPage() {
         }
 
         const profile: ENSProfile = await res.json();
+        if (!profile.address) {
+          setError(`${ensName} has no ETH address`);
+          return;
+        }
+
         const newNode: GraphNode = {
           id: ensName,
           ensName,
@@ -47,25 +76,47 @@ export default function GraphPage() {
           ethBalance: profile.ethBalance,
         };
 
-        setNodes((prev) => {
-          const newEdges = prev.map((existing) => ({
-            source: existing.id,
-            target: newNode.id,
-          }));
-          setEdges((prevEdges) => [...prevEdges, ...newEdges]);
-          return [...prev, newNode];
-        });
+        const existingNodes = nodesRef.current;
+        nodesRef.current = [...existingNodes, newNode];
+        setNodes(nodesRef.current);
+
+        // Fetch transaction data between new node and all existing nodes
+        if (existingNodes.length > 0) {
+          setTxLoading(true);
+          const txResults = await Promise.all(
+            existingNodes
+              .filter((n) => n.address)
+              .map(async (existing) => {
+                const summary = await fetchTransactions(
+                  newNode.address!,
+                  existing.address!
+                );
+                return {
+                  source: existing.id,
+                  target: newNode.id,
+                  txCount: summary.txCount,
+                  totalValueEth: summary.totalValueEth,
+                  lastTxTimestamp: summary.lastTxTimestamp,
+                  types: summary.types,
+                };
+              })
+          );
+
+          setEdges((prev) => [...prev, ...txResults]);
+          setTxLoading(false);
+        }
       } catch {
         setError(`Network error resolving ${ensName}`);
       } finally {
         setLoading(null);
       }
     },
-    [nodes]
+    [fetchTransactions]
   );
 
   const removeNode = useCallback((ensName: string) => {
-    setNodes((prev) => prev.filter((n) => n.ensName !== ensName));
+    nodesRef.current = nodesRef.current.filter((n) => n.ensName !== ensName);
+    setNodes(nodesRef.current);
     setEdges((prev) => prev.filter((e) => e.source !== ensName && e.target !== ensName));
   }, []);
 
@@ -76,12 +127,9 @@ export default function GraphPage() {
     setInput("");
   };
 
-  const handleNodeClick = useCallback(
-    (ensName: string) => {
-      router.push(`/profile/${ensName}`);
-    },
-    [router]
-  );
+  const handleNodeClick = useCallback((ensName: string) => {
+    window.open(`/profile/${ensName}`, "_blank");
+  }, []);
 
   return (
     <main className="flex flex-col h-screen px-4 py-5 max-w-[1400px] mx-auto w-full">
@@ -188,14 +236,21 @@ export default function GraphPage() {
       )}
 
       {/* Graph */}
-      <div className="flex-1 min-h-0">
+      <div className="flex-1 min-h-0 relative">
         <NetworkGraph nodes={nodes} edges={edges} onNodeClick={handleNodeClick} />
+        {txLoading && (
+          <div className="absolute top-3 right-3 flex items-center gap-2 bg-dark-100/90 border border-white/10 rounded-lg px-3 py-1.5 backdrop-blur-sm">
+            <div className="w-3 h-3 border-2 border-accent-purple/40 border-t-accent-purple rounded-full animate-spin" />
+            <span className="text-xs text-gray-400">Checking on-chain transactions...</span>
+          </div>
+        )}
       </div>
 
       {/* Footer hint */}
       {nodes.length > 0 && (
         <p className="text-center text-gray-600 text-[10px] mt-2 flex-shrink-0">
           Drag nodes to rearrange &middot; Scroll to zoom &middot; Click a node to view profile
+          &middot; Solid lines = on-chain transactions
         </p>
       )}
     </main>
