@@ -7,6 +7,18 @@ const nextConfig = {
       { protocol: "http", hostname: "**" },
     ],
   },
+  async rewrites() {
+    return [
+      {
+        source: "/api/friendships/:path*",
+        destination: "http://localhost:8000/api/friendships/:path*",
+      },
+      {
+        source: "/api/friendships",
+        destination: "http://localhost:8000/api/friendships/",
+      },
+    ];
+  },
 };
 
 export default nextConfig;
