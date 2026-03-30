@@ -4,12 +4,13 @@ interface EtherscanTx {
   hash: string;
   from: string;
   to: string;
-  value: string; // wei
+  value: string;
   timeStamp: string;
   txreceipt_status?: string;
   isError?: string;
   tokenName?: string;
   tokenSymbol?: string;
+  contractAddress?: string;
 }
 
 interface EtherscanResponse {
@@ -18,13 +19,20 @@ interface EtherscanResponse {
   result: EtherscanTx[] | string;
 }
 
-export interface TransactionSummary {
-  txCount: number;
+export interface RelationshipSummary {
+  // Direct transactions between the pair
+  directTxCount: number;
   totalValueEth: string;
   lastTxTimestamp: number | null;
   aToB: number;
   bToA: number;
-  types: string[]; // e.g. ["eth", "erc20", "internal"]
+  // Shared on-chain activity
+  sharedTokens: string[];       // token symbols both addresses have used
+  sharedContracts: number;      // number of contracts both interacted with
+  // Relationship strength (0-100)
+  strength: number;
+  // Human-readable label
+  label: string;
 }
 
 function getApiKey(): string {
@@ -34,7 +42,7 @@ function getApiKey(): string {
 async function etherscanFetch(
   action: string,
   address: string,
-  offset = 10000
+  offset = 5000
 ): Promise<EtherscanTx[]> {
   const apiKey = getApiKey();
   const params = new URLSearchParams({
@@ -50,119 +58,97 @@ async function etherscanFetch(
   if (apiKey) params.set("apikey", apiKey);
 
   const res = await fetch(`${ETHERSCAN_BASE}?${params}`, {
-    next: { revalidate: 300 },
+    next: { revalidate: 600 },
   });
-  if (!res.ok) throw new Error(`Etherscan HTTP ${res.status}`);
+  if (!res.ok) return [];
 
   const data: EtherscanResponse = await res.json();
 
-  if (data.status === "0" && typeof data.result === "string" &&
-      data.result.toLowerCase().includes("no transactions")) {
-    return [];
-  }
-  if (data.status === "0" && data.message === "NOTOK") {
-    throw new Error(`Etherscan error: ${data.result}`);
-  }
   if (!Array.isArray(data.result)) return [];
-
   return data.result;
+}
+
+// Extract unique contract addresses and token symbols from token transfers
+function extractTokenProfile(tokenTxs: EtherscanTx[]): {
+  tokens: Map<string, string>; // contractAddress -> symbol
+  contracts: Set<string>;       // all contracts interacted with
+} {
+  const tokens = new Map<string, string>();
+  const contracts = new Set<string>();
+
+  for (const tx of tokenTxs) {
+    if (tx.contractAddress && tx.tokenSymbol) {
+      tokens.set(tx.contractAddress.toLowerCase(), tx.tokenSymbol);
+    }
+    if (tx.to) contracts.add(tx.to.toLowerCase());
+    if (tx.from) contracts.add(tx.from.toLowerCase());
+  }
+
+  return { tokens, contracts };
+}
+
+// Extract contracts interacted with from normal txs
+function extractContractInteractions(txs: EtherscanTx[]): Set<string> {
+  const contracts = new Set<string>();
+  for (const tx of txs) {
+    // If tx has input data > "0x", it's a contract interaction
+    if (tx.to) contracts.add(tx.to.toLowerCase());
+  }
+  return contracts;
 }
 
 function filterForCounterparty(txs: EtherscanTx[], counterparty: string): EtherscanTx[] {
   const cp = counterparty.toLowerCase();
   return txs.filter((tx) => {
-    const isSuccess = tx.txreceipt_status === "1" || tx.isError === "0" || (!tx.txreceipt_status && !tx.isError);
+    const isSuccess = tx.txreceipt_status === "1" || tx.isError === "0" ||
+      (!tx.txreceipt_status && !tx.isError);
     return isSuccess && (tx.from.toLowerCase() === cp || tx.to.toLowerCase() === cp);
   });
 }
 
-export async function getTransactionsBetween(
+function weiToEth(totalWei: bigint): string {
+  const ethWhole = totalWei / BigInt(10 ** 18);
+  const ethFraction = totalWei % BigInt(10 ** 18);
+  const fractionStr = ethFraction.toString().padStart(18, "0").slice(0, 4);
+  return `${ethWhole}.${fractionStr}`;
+}
+
+export async function getRelationship(
   addressA: string,
   addressB: string
-): Promise<TransactionSummary> {
+): Promise<RelationshipSummary> {
   const a = addressA.toLowerCase();
   const b = addressB.toLowerCase();
 
-  const empty: TransactionSummary = {
-    txCount: 0, totalValueEth: "0", lastTxTimestamp: null, aToB: 0, bToA: 0, types: [],
-  };
+  // Fetch activity for both addresses in parallel
+  const [normalA, tokenA, normalB, tokenB] = await Promise.all([
+    etherscanFetch("txlist", a, 2000),
+    etherscanFetch("tokentx", a, 2000),
+    etherscanFetch("txlist", b, 2000),
+    etherscanFetch("tokentx", b, 2000),
+  ]);
 
-  // Check normal ETH transactions first
-  const normalTxs = await etherscanFetch("txlist", a);
-  const ethRelevant = filterForCounterparty(normalTxs, b);
+  // 1. Direct transactions between A and B
+  const directFromA = filterForCounterparty(normalA, b);
+  const directFromB = filterForCounterparty(normalB, a);
+  const directTokenFromA = filterForCounterparty(tokenA, b);
+  const directTokenFromB = filterForCounterparty(tokenB, a);
 
-  // Check internal transactions (contract-mediated transfers)
-  let internalRelevant: EtherscanTx[] = [];
-  try {
-    const internalTxs = await etherscanFetch("txlistinternal", a);
-    internalRelevant = filterForCounterparty(internalTxs, b);
-  } catch {
-    // Internal tx API can fail for some addresses
-  }
-
-  // Check ERC-20 token transfers
-  let erc20Relevant: EtherscanTx[] = [];
-  try {
-    const erc20Txs = await etherscanFetch("tokentx", a);
-    erc20Relevant = filterForCounterparty(erc20Txs, b);
-  } catch {
-    // Token tx API can fail
-  }
-
-  // If nothing from A's side, try from B's side
-  if (ethRelevant.length === 0 && internalRelevant.length === 0 && erc20Relevant.length === 0) {
-    const normalTxsB = await etherscanFetch("txlist", b);
-    const ethFromB = filterForCounterparty(normalTxsB, a);
-
-    let internalFromB: EtherscanTx[] = [];
-    try {
-      const internalTxsB = await etherscanFetch("txlistinternal", b);
-      internalFromB = filterForCounterparty(internalTxsB, a);
-    } catch {}
-
-    let erc20FromB: EtherscanTx[] = [];
-    try {
-      const erc20TxsB = await etherscanFetch("tokentx", b);
-      erc20FromB = filterForCounterparty(erc20TxsB, a);
-    } catch {}
-
-    if (ethFromB.length === 0 && internalFromB.length === 0 && erc20FromB.length === 0) {
-      return empty;
-    }
-
-    return buildSummary(ethFromB, internalFromB, erc20FromB, a, b);
-  }
-
-  return buildSummary(ethRelevant, internalRelevant, erc20Relevant, a, b);
-}
-
-function buildSummary(
-  ethTxs: EtherscanTx[],
-  internalTxs: EtherscanTx[],
-  erc20Txs: EtherscanTx[],
-  a: string,
-  b: string
-): TransactionSummary {
-  const types: string[] = [];
-  if (ethTxs.length > 0) types.push("eth");
-  if (internalTxs.length > 0) types.push("internal");
-  if (erc20Txs.length > 0) types.push("erc20");
-
-  const allTxs = [...ethTxs, ...internalTxs];
-  // Deduplicate by hash
-  const seen = new Set<string>();
-  const uniqueTxs = allTxs.filter((tx) => {
-    if (seen.has(tx.hash)) return false;
-    seen.add(tx.hash);
-    return true;
-  });
+  // Deduplicate direct txs
+  const seenHashes = new Set<string>();
+  const allDirect = [...directFromA, ...directFromB, ...directTokenFromA, ...directTokenFromB]
+    .filter((tx) => {
+      if (seenHashes.has(tx.hash)) return false;
+      seenHashes.add(tx.hash);
+      return true;
+    });
 
   let totalWei = BigInt(0);
   let latestTs = 0;
   let aToB = 0;
   let bToA = 0;
 
-  for (const tx of uniqueTxs) {
+  for (const tx of allDirect) {
     totalWei += BigInt(tx.value);
     const ts = parseInt(tx.timeStamp, 10);
     if (ts > latestTs) latestTs = ts;
@@ -170,28 +156,64 @@ function buildSummary(
     else bToA++;
   }
 
-  // Also count ERC-20 transfers (they have value=0 in ETH but represent token interactions)
-  for (const tx of erc20Txs) {
-    const ts = parseInt(tx.timeStamp, 10);
-    if (ts > latestTs) latestTs = ts;
-    if (tx.from.toLowerCase() === a) aToB++;
-    else bToA++;
+  // 2. Shared tokens (both addresses have interacted with the same token contracts)
+  const profileA = extractTokenProfile(tokenA);
+  const profileB = extractTokenProfile(tokenB);
+
+  const sharedTokens: string[] = [];
+  for (const [contract, symbol] of profileA.tokens) {
+    if (profileB.tokens.has(contract)) {
+      sharedTokens.push(symbol);
+    }
+  }
+  // Deduplicate and limit
+  const uniqueSharedTokens = [...new Set(sharedTokens)].slice(0, 10);
+
+  // 3. Shared contracts (both interacted with same contracts via normal txs)
+  const contractsA = extractContractInteractions(normalA);
+  const contractsB = extractContractInteractions(normalB);
+  let sharedContractCount = 0;
+  for (const c of contractsA) {
+    if (contractsB.has(c) && c !== a && c !== b) {
+      sharedContractCount++;
+    }
   }
 
-  const totalTxCount = uniqueTxs.length + erc20Txs.length;
+  // 4. Calculate relationship strength (0-100)
+  let strength = 0;
+  if (allDirect.length > 0) strength += Math.min(50, allDirect.length * 10);
+  if (uniqueSharedTokens.length > 0) strength += Math.min(30, uniqueSharedTokens.length * 5);
+  if (sharedContractCount > 0) strength += Math.min(20, sharedContractCount * 2);
+  strength = Math.min(100, strength);
 
-  // Convert wei to ETH
-  const ethWhole = totalWei / BigInt(10 ** 18);
-  const ethFraction = totalWei % BigInt(10 ** 18);
-  const fractionStr = ethFraction.toString().padStart(18, "0").slice(0, 4);
-  const totalValueEth = `${ethWhole}.${fractionStr}`;
+  // 5. Build human-readable label
+  let label = "";
+  if (allDirect.length > 0) {
+    const ethVal = parseFloat(weiToEth(totalWei));
+    label = `${allDirect.length} tx`;
+    if (ethVal > 0.001) label += ` · ${ethVal.toFixed(2)} ETH`;
+  }
+  if (uniqueSharedTokens.length > 0) {
+    const tokenLabel = uniqueSharedTokens.slice(0, 3).join(", ");
+    const extra = uniqueSharedTokens.length > 3 ? ` +${uniqueSharedTokens.length - 3}` : "";
+    label += label ? ` · ${tokenLabel}${extra}` : `${tokenLabel}${extra}`;
+  }
+  if (!label && sharedContractCount > 0) {
+    label = `${sharedContractCount} shared contracts`;
+  }
+  if (!label) {
+    label = "no on-chain link";
+  }
 
   return {
-    txCount: totalTxCount,
-    totalValueEth,
+    directTxCount: allDirect.length,
+    totalValueEth: weiToEth(totalWei),
     lastTxTimestamp: latestTs || null,
     aToB,
     bToA,
-    types,
+    sharedTokens: uniqueSharedTokens,
+    sharedContracts: sharedContractCount,
+    strength,
+    label,
   };
 }

@@ -7,11 +7,16 @@ import { NetworkGraph, type GraphNode, type GraphEdge } from "@/components/Netwo
 
 const SUGGESTIONS = ["vitalik.eth", "nick.eth", "brantly.eth", "sassal.eth"];
 
-interface TxSummary {
-  txCount: number;
+interface RelationshipResponse {
+  directTxCount: number;
   totalValueEth: string;
   lastTxTimestamp: number | null;
-  types: string[];
+  aToB: number;
+  bToA: number;
+  sharedTokens: string[];
+  sharedContracts: number;
+  strength: number;
+  label: string;
 }
 
 export default function GraphPage() {
@@ -24,16 +29,21 @@ export default function GraphPage() {
   const [error, setError] = useState<string | null>(null);
   const nodesRef = useRef<GraphNode[]>([]);
 
-  const fetchTransactions = useCallback(
-    async (addressA: string, addressB: string): Promise<TxSummary> => {
+  const fetchRelationship = useCallback(
+    async (addressA: string, addressB: string): Promise<RelationshipResponse> => {
+      const empty: RelationshipResponse = {
+        directTxCount: 0, totalValueEth: "0", lastTxTimestamp: null,
+        aToB: 0, bToA: 0, sharedTokens: [], sharedContracts: 0,
+        strength: 0, label: "no on-chain link",
+      };
       try {
         const res = await fetch(
           `/api/transactions?a=${encodeURIComponent(addressA)}&b=${encodeURIComponent(addressB)}`
         );
-        if (!res.ok) return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
+        if (!res.ok) return empty;
         return await res.json();
       } catch {
-        return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
+        return empty;
       }
     },
     []
@@ -80,29 +90,30 @@ export default function GraphPage() {
         nodesRef.current = [...existingNodes, newNode];
         setNodes(nodesRef.current);
 
-        // Fetch transaction data between new node and all existing nodes
+        // Fetch relationship data between new node and all existing nodes
         if (existingNodes.length > 0) {
           setTxLoading(true);
-          const txResults = await Promise.all(
+          const results = await Promise.all(
             existingNodes
               .filter((n) => n.address)
               .map(async (existing) => {
-                const summary = await fetchTransactions(
-                  newNode.address!,
-                  existing.address!
-                );
-                return {
+                const rel = await fetchRelationship(newNode.address!, existing.address!);
+                const edge: GraphEdge = {
                   source: existing.id,
                   target: newNode.id,
-                  txCount: summary.txCount,
-                  totalValueEth: summary.totalValueEth,
-                  lastTxTimestamp: summary.lastTxTimestamp,
-                  types: summary.types,
+                  directTxCount: rel.directTxCount,
+                  totalValueEth: rel.totalValueEth,
+                  lastTxTimestamp: rel.lastTxTimestamp,
+                  sharedTokens: rel.sharedTokens,
+                  sharedContracts: rel.sharedContracts,
+                  strength: rel.strength,
+                  label: rel.label,
                 };
+                return edge;
               })
           );
 
-          setEdges((prev) => [...prev, ...txResults]);
+          setEdges((prev) => [...prev, ...results]);
           setTxLoading(false);
         }
       } catch {
@@ -111,7 +122,7 @@ export default function GraphPage() {
         setLoading(null);
       }
     },
-    [fetchTransactions]
+    [fetchRelationship]
   );
 
   const removeNode = useCallback((ensName: string) => {
@@ -130,6 +141,9 @@ export default function GraphPage() {
   const handleNodeClick = useCallback((ensName: string) => {
     window.open(`/profile/${ensName}`, "_blank");
   }, []);
+
+  // Summary stats
+  const strongEdges = edges.filter((e) => e.strength > 0);
 
   return (
     <main className="flex flex-col h-screen px-4 py-5 max-w-[1400px] mx-auto w-full">
@@ -195,41 +209,58 @@ export default function GraphPage() {
         </div>
       )}
 
-      {/* Name chips */}
+      {/* Name chips + stats */}
       {(nodes.length > 0 || loading) && (
-        <div className="flex flex-wrap gap-2 mb-4 flex-shrink-0">
-          {nodes.map((node) => (
-            <div
-              key={node.ensName}
-              className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] rounded-full pl-1.5 pr-2.5 py-1 hover:bg-white/[0.07] transition-colors group"
-            >
-              {node.avatar ? (
-                <img
-                  src={node.avatar}
-                  alt=""
-                  className="w-5 h-5 rounded-full object-cover"
-                />
-              ) : (
-                <div className="w-5 h-5 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-[10px] font-bold text-white">
-                  {node.ensName.charAt(0).toUpperCase()}
-                </div>
-              )}
-              <span className="text-xs text-gray-300">{node.displayName}</span>
-              <button
-                onClick={() => removeNode(node.ensName)}
-                className="text-gray-600 hover:text-red-400 transition-colors"
+        <div className="flex items-start justify-between gap-4 mb-4 flex-shrink-0">
+          <div className="flex flex-wrap gap-2 min-w-0">
+            {nodes.map((node) => (
+              <div
+                key={node.ensName}
+                className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] rounded-full pl-1.5 pr-2.5 py-1 hover:bg-white/[0.07] transition-colors group"
               >
-                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  <path d="M18 6L6 18M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-          ))}
+                {node.avatar ? (
+                  <img
+                    src={node.avatar}
+                    alt=""
+                    className="w-5 h-5 rounded-full object-cover"
+                  />
+                ) : (
+                  <div className="w-5 h-5 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-[10px] font-bold text-white">
+                    {node.ensName.charAt(0).toUpperCase()}
+                  </div>
+                )}
+                <span className="text-xs text-gray-300">{node.displayName}</span>
+                <button
+                  onClick={() => removeNode(node.ensName)}
+                  className="text-gray-600 hover:text-red-400 transition-colors"
+                >
+                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            ))}
 
-          {loading && (
-            <div className="flex items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1 animate-pulse">
-              <div className="w-5 h-5 rounded-full bg-white/10" />
-              <span className="text-xs text-gray-500">{loading}</span>
+            {loading && (
+              <div className="flex items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1 animate-pulse">
+                <div className="w-5 h-5 rounded-full bg-white/10" />
+                <span className="text-xs text-gray-500">{loading}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Stats badge */}
+          {nodes.length >= 2 && !txLoading && (
+            <div className="flex-shrink-0 flex items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-1.5">
+              <div className="text-center">
+                <div className="text-xs font-semibold text-white">{strongEdges.length}</div>
+                <div className="text-[9px] text-gray-500">links</div>
+              </div>
+              <div className="w-px h-5 bg-white/10" />
+              <div className="text-center">
+                <div className="text-xs font-semibold text-white">{nodes.length}</div>
+                <div className="text-[9px] text-gray-500">nodes</div>
+              </div>
             </div>
           )}
         </div>
@@ -241,7 +272,7 @@ export default function GraphPage() {
         {txLoading && (
           <div className="absolute top-3 right-3 flex items-center gap-2 bg-dark-100/90 border border-white/10 rounded-lg px-3 py-1.5 backdrop-blur-sm">
             <div className="w-3 h-3 border-2 border-accent-purple/40 border-t-accent-purple rounded-full animate-spin" />
-            <span className="text-xs text-gray-400">Checking on-chain transactions...</span>
+            <span className="text-xs text-gray-400">Analyzing on-chain relationships...</span>
           </div>
         )}
       </div>
@@ -249,8 +280,8 @@ export default function GraphPage() {
       {/* Footer hint */}
       {nodes.length > 0 && (
         <p className="text-center text-gray-600 text-[10px] mt-2 flex-shrink-0">
-          Drag nodes to rearrange &middot; Scroll to zoom &middot; Click a node to view profile
-          &middot; Solid lines = on-chain transactions
+          Drag nodes to rearrange &middot; Scroll to zoom &middot; Click node to view profile
+          &middot; Hover edges for details &middot; Thicker lines = stronger on-chain relationship
         </p>
       )}
     </main>
