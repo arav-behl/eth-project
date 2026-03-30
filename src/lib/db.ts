@@ -47,6 +47,16 @@ function db(): Database.Database {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(graph_id, source_ens, target_ens)
     );
+
+    CREATE TABLE IF NOT EXISTS friendships (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ens_a TEXT NOT NULL,
+      ens_b TEXT NOT NULL,
+      address_a TEXT,
+      address_b TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(ens_a, ens_b)
+    );
   `);
 
   return _db;
@@ -194,4 +204,64 @@ export function listGraphs(): Array<{ id: string; name: string; nodeCount: numbe
 
 export function deleteGraph(graphId: string): void {
   db().prepare("DELETE FROM graphs WHERE id = ?").run(graphId);
+}
+
+/* ── Friendships ────────────────────────────────────────────── */
+
+export interface Friendship {
+  id: number;
+  ens_a: string;
+  ens_b: string;
+  address_a: string | null;
+  address_b: string | null;
+  created_at: string;
+}
+
+export function getFriendships(ensFilter?: string): Friendship[] {
+  const d = db();
+  if (ensFilter) {
+    return d
+      .prepare("SELECT * FROM friendships WHERE ens_a = ? OR ens_b = ? ORDER BY created_at DESC")
+      .all(ensFilter, ensFilter) as Friendship[];
+  }
+  return d.prepare("SELECT * FROM friendships ORDER BY created_at DESC").all() as Friendship[];
+}
+
+export function addFriendship(
+  ens_a: string,
+  ens_b: string,
+  address_a?: string,
+  address_b?: string
+): Friendship | null {
+  const d = db();
+  const normalized_a = ens_a.toLowerCase();
+  const normalized_b = ens_b.toLowerCase();
+
+  if (normalized_a === normalized_b) return null;
+
+  const [low, high] = normalized_a < normalized_b ? [normalized_a, normalized_b] : [normalized_b, normalized_a];
+
+  try {
+    const result = d
+      .prepare(
+        "INSERT INTO friendships (ens_a, ens_b, address_a, address_b) VALUES (?, ?, ?, ?)"
+      )
+      .run(low, high, address_a || null, address_b || null);
+
+    return d.prepare("SELECT * FROM friendships WHERE id = ?").get(result.lastInsertRowid) as Friendship;
+  } catch {
+    return null;
+  }
+}
+
+export function deleteFriendship(ens_a: string, ens_b: string): boolean {
+  const d = db();
+  const normalized_a = ens_a.toLowerCase();
+  const normalized_b = ens_b.toLowerCase();
+
+  const result = d
+    .prepare("DELETE FROM friendships WHERE (ens_a = ? AND ens_b = ?) OR (ens_a = ? AND ens_b = ?)")
+    .run(normalized_a, normalized_b, normalized_b, normalized_a);
+
+  return result.changes > 0;
 }
