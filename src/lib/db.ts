@@ -206,6 +206,9 @@ export function deleteGraph(graphId: string): void {
   db().prepare("DELETE FROM graphs WHERE id = ?").run(graphId);
 }
 
+/* ── Friendships ────────────────────────────────────────────── */
+
+
 export interface Friendship {
   id: number;
   ens_a: string;
