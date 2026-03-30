@@ -4,19 +4,22 @@ import { useState, useCallback, useRef, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import type { ENSProfile } from "@/lib/ens";
 import { NetworkGraph, type GraphNode, type GraphEdge } from "@/components/NetworkGraph";
+import { FriendshipsPanel } from "@/components/FriendshipsPanel";
 
 const SUGGESTIONS = ["vitalik.eth", "nick.eth", "brantly.eth", "sassal.eth"];
 
-interface RelationshipResponse {
-  directTxCount: number;
+interface TxSummary {
+  txCount: number;
   totalValueEth: string;
   lastTxTimestamp: number | null;
-  aToB: number;
-  bToA: number;
-  sharedTokens: string[];
-  sharedContracts: number;
-  strength: number;
-  label: string;
+  types: string[];
+}
+
+interface FriendshipRecord {
+  id: number;
+  ens_a: string;
+  ens_b: string;
+  created_at: string;
 }
 
 export default function GraphPage() {
@@ -27,27 +30,66 @@ export default function GraphPage() {
   const [loading, setLoading] = useState<string | null>(null);
   const [txLoading, setTxLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedNodes, setSelectedNodes] = useState<string[]>([]);
+  const [friendshipLoading, setFriendshipLoading] = useState(false);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   const nodesRef = useRef<GraphNode[]>([]);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const fetchRelationship = useCallback(
-    async (addressA: string, addressB: string): Promise<RelationshipResponse> => {
-      const empty: RelationshipResponse = {
-        directTxCount: 0, totalValueEth: "0", lastTxTimestamp: null,
-        aToB: 0, bToA: 0, sharedTokens: [], sharedContracts: 0,
-        strength: 0, label: "no on-chain link",
-      };
+  const showToast = useCallback((message: string, type: "success" | "error") => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ message, type });
+    toastTimerRef.current = setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  const fetchTransactions = useCallback(
+    async (addressA: string, addressB: string): Promise<TxSummary> => {
       try {
         const res = await fetch(
           `/api/transactions?a=${encodeURIComponent(addressA)}&b=${encodeURIComponent(addressB)}`
         );
-        if (!res.ok) return empty;
+        if (!res.ok) return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
         return await res.json();
       } catch {
-        return empty;
+        return { txCount: 0, totalValueEth: "0", lastTxTimestamp: null, types: [] };
       }
     },
     []
   );
+
+  const fetchFriendships = useCallback(async (): Promise<FriendshipRecord[]> => {
+    try {
+      const res = await fetch("/api/friendships");
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.friendships ?? [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const refreshFriendshipEdges = useCallback(async () => {
+    const friendships = await fetchFriendships();
+    const currentNodeIds = new Set(nodesRef.current.map((n) => n.ensName));
+
+    setEdges((prev) => {
+      const nonFriendship = prev.filter((e) => e.edgeType !== "friendship");
+      const friendshipEdges: GraphEdge[] = friendships
+        .filter((f) => currentNodeIds.has(f.ens_a) && currentNodeIds.has(f.ens_b))
+        .map((f) => ({
+          source: f.ens_a,
+          target: f.ens_b,
+          txCount: 0,
+          totalValueEth: "0",
+          lastTxTimestamp: null,
+          types: [],
+          edgeType: "friendship" as const,
+        }));
+      return [...nonFriendship, ...friendshipEdges];
+    });
+  }, [fetchFriendships]);
 
   const addNode = useCallback(
     async (rawInput: string) => {
@@ -90,45 +132,49 @@ export default function GraphPage() {
         nodesRef.current = [...existingNodes, newNode];
         setNodes(nodesRef.current);
 
-        // Fetch relationship data between new node and all existing nodes
+        // Fetch transaction data between new node and all existing nodes
         if (existingNodes.length > 0) {
           setTxLoading(true);
-          const results = await Promise.all(
+          const txResults = await Promise.all(
             existingNodes
               .filter((n) => n.address)
               .map(async (existing) => {
-                const rel = await fetchRelationship(newNode.address!, existing.address!);
-                const edge: GraphEdge = {
+                const summary = await fetchTransactions(
+                  newNode.address!,
+                  existing.address!
+                );
+                return {
                   source: existing.id,
                   target: newNode.id,
-                  directTxCount: rel.directTxCount,
-                  totalValueEth: rel.totalValueEth,
-                  lastTxTimestamp: rel.lastTxTimestamp,
-                  sharedTokens: rel.sharedTokens,
-                  sharedContracts: rel.sharedContracts,
-                  strength: rel.strength,
-                  label: rel.label,
+                  txCount: summary.txCount,
+                  totalValueEth: summary.totalValueEth,
+                  lastTxTimestamp: summary.lastTxTimestamp,
+                  types: summary.types,
+                  edgeType: "inferred" as const,
                 };
-                return edge;
               })
           );
 
-          setEdges((prev) => [...prev, ...results]);
+          setEdges((prev) => [...prev, ...txResults]);
           setTxLoading(false);
         }
+
+        // Refresh friendship edges after adding a node
+        await refreshFriendshipEdges();
       } catch {
         setError(`Network error resolving ${ensName}`);
       } finally {
         setLoading(null);
       }
     },
-    [fetchRelationship]
+    [fetchTransactions, refreshFriendshipEdges]
   );
 
   const removeNode = useCallback((ensName: string) => {
     nodesRef.current = nodesRef.current.filter((n) => n.ensName !== ensName);
     setNodes(nodesRef.current);
     setEdges((prev) => prev.filter((e) => e.source !== ensName && e.target !== ensName));
+    setSelectedNodes((prev) => prev.filter((n) => n !== ensName));
   }, []);
 
   const handleSubmit = (e: FormEvent) => {
@@ -142,8 +188,120 @@ export default function GraphPage() {
     window.open(`/profile/${ensName}`, "_blank");
   }, []);
 
-  // Summary stats
-  const strongEdges = edges.filter((e) => e.strength > 0);
+  const handleNodeSelect = useCallback((ensName: string) => {
+    setSelectedNodes((prev) => {
+      if (prev.includes(ensName)) {
+        return prev.filter((n) => n !== ensName);
+      }
+      if (prev.length >= 2) {
+        return [prev[1], ensName];
+      }
+      return [...prev, ensName];
+    });
+  }, []);
+
+  const handleEdgeClick = useCallback(
+    async (source: string, target: string, edgeType: "inferred" | "friendship") => {
+      if (edgeType !== "friendship") return;
+
+      const confirmed = window.confirm(
+        `Remove friendship between ${source} and ${target}?`
+      );
+      if (!confirmed) return;
+
+      setFriendshipLoading(true);
+      try {
+        const res = await fetch("/api/friendships", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ens_a: source, ens_b: target }),
+        });
+        if (res.ok) {
+          setEdges((prev) =>
+            prev.filter(
+              (e) =>
+                !(
+                  e.edgeType === "friendship" &&
+                  ((e.source === source && e.target === target) ||
+                    (e.source === target && e.target === source))
+                )
+            )
+          );
+          showToast(`Removed friendship: ${source} ↔ ${target}`, "success");
+        } else {
+          const data = await res.json();
+          showToast(data.error || "Failed to delete friendship", "error");
+        }
+      } catch {
+        showToast("Network error deleting friendship", "error");
+      } finally {
+        setFriendshipLoading(false);
+      }
+    },
+    [showToast]
+  );
+
+  const addFriendship = useCallback(async () => {
+    if (selectedNodes.length !== 2) return;
+
+    const [ensA, ensB] = selectedNodes;
+    const nodeA = nodesRef.current.find((n) => n.ensName === ensA);
+    const nodeB = nodesRef.current.find((n) => n.ensName === ensB);
+
+    setFriendshipLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/friendships", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ens_a: ensA,
+          ens_b: ensB,
+          address_a: nodeA?.address,
+          address_b: nodeB?.address,
+          avatar_a: nodeA?.avatar,
+          avatar_b: nodeB?.avatar,
+          display_name_a: nodeA?.displayName,
+          display_name_b: nodeB?.displayName,
+        }),
+      });
+
+      if (res.ok || res.status === 201) {
+        // Add edge optimistically
+        setEdges((prev) => [
+          ...prev,
+          {
+            source: ensA,
+            target: ensB,
+            txCount: 0,
+            totalValueEth: "0",
+            lastTxTimestamp: null,
+            types: [],
+            edgeType: "friendship" as const,
+          },
+        ]);
+        setSelectedNodes([]);
+        setSelectionMode(false);
+        showToast(`Friendship added: ${ensA} ↔ ${ensB}`, "success");
+      } else {
+        const data = await res.json();
+        setError(data.error || "Failed to create friendship");
+      }
+    } catch {
+      setError("Network error creating friendship");
+    } finally {
+      setFriendshipLoading(false);
+    }
+  }, [selectedNodes, showToast]);
+
+  const cancelSelection = useCallback(() => {
+    setSelectedNodes([]);
+    setSelectionMode(false);
+  }, []);
+
+  const friendshipCount = edges.filter((e) => e.edgeType === "friendship").length;
+  const inferredCount = edges.filter((e) => e.edgeType === "inferred" && e.txCount > 0).length;
 
   return (
     <main className="flex flex-col h-screen px-4 py-5 max-w-[1400px] mx-auto w-full">
@@ -155,9 +313,30 @@ export default function GraphPage() {
         >
           ENS Explorer
         </button>
-        <h1 className="text-xl font-bold bg-gradient-to-r from-accent-purple via-accent-blue to-accent-green bg-clip-text text-transparent">
-          Social Graph
-        </h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-xl font-bold bg-gradient-to-r from-accent-purple via-accent-blue to-accent-green bg-clip-text text-transparent">
+            Social Graph
+          </h1>
+          {/* Manage Friendships button */}
+          <button
+            id="manage-friendships-btn"
+            onClick={() => setPanelOpen(true)}
+            className="relative flex items-center gap-2 px-3.5 py-1.5 bg-gradient-to-r from-amber-500/10 to-red-500/10 hover:from-amber-500/20 hover:to-red-500/20 border border-amber-500/25 hover:border-amber-500/40 rounded-lg text-xs font-medium text-amber-300 hover:text-amber-200 transition-all group"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+            Manage Friendships
+            {friendshipCount > 0 && (
+              <span className="ml-0.5 min-w-[18px] h-[18px] flex items-center justify-center bg-amber-500/30 rounded-full text-[10px] font-bold text-amber-200 px-1">
+                {friendshipCount}
+              </span>
+            )}
+          </button>
+        </div>
       </header>
 
       {/* Input */}
@@ -209,58 +388,84 @@ export default function GraphPage() {
         </div>
       )}
 
-      {/* Name chips + stats */}
+      {/* Name chips + Friendship controls */}
       {(nodes.length > 0 || loading) && (
-        <div className="flex items-start justify-between gap-4 mb-4 flex-shrink-0">
-          <div className="flex flex-wrap gap-2 min-w-0">
-            {nodes.map((node) => (
-              <div
-                key={node.ensName}
-                className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] rounded-full pl-1.5 pr-2.5 py-1 hover:bg-white/[0.07] transition-colors group"
+        <div className="flex flex-wrap items-center gap-2 mb-4 flex-shrink-0">
+          {nodes.map((node) => (
+            <div
+              key={node.ensName}
+              className="flex items-center gap-2 bg-white/[0.04] border border-white/[0.08] rounded-full pl-1.5 pr-2.5 py-1 hover:bg-white/[0.07] transition-colors group"
+            >
+              {node.avatar ? (
+                <img
+                  src={node.avatar}
+                  alt=""
+                  className="w-5 h-5 rounded-full object-cover"
+                />
+              ) : (
+                <div className="w-5 h-5 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-[10px] font-bold text-white">
+                  {node.ensName.charAt(0).toUpperCase()}
+                </div>
+              )}
+              <span className="text-xs text-gray-300">{node.displayName}</span>
+              <button
+                onClick={() => removeNode(node.ensName)}
+                className="text-gray-600 hover:text-red-400 transition-colors"
               >
-                {node.avatar ? (
-                  <img
-                    src={node.avatar}
-                    alt=""
-                    className="w-5 h-5 rounded-full object-cover"
-                  />
-                ) : (
-                  <div className="w-5 h-5 rounded-full bg-gradient-to-br from-accent-purple to-accent-blue flex items-center justify-center text-[10px] font-bold text-white">
-                    {node.ensName.charAt(0).toUpperCase()}
-                  </div>
-                )}
-                <span className="text-xs text-gray-300">{node.displayName}</span>
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          ))}
+
+          {loading && (
+            <div className="flex items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1 animate-pulse">
+              <div className="w-5 h-5 rounded-full bg-white/10" />
+              <span className="text-xs text-gray-500">{loading}</span>
+            </div>
+          )}
+
+          {/* Friendship action buttons */}
+          {nodes.length >= 2 && (
+            <div className="ml-auto flex items-center gap-2">
+              {!selectionMode ? (
                 <button
-                  onClick={() => removeNode(node.ensName)}
-                  className="text-gray-600 hover:text-red-400 transition-colors"
+                  onClick={() => {
+                    setSelectionMode(true);
+                    setSelectedNodes([]);
+                    setError(null);
+                  }}
+                  className="px-3 py-1.5 bg-gradient-to-r from-amber-500/20 to-red-500/20 hover:from-amber-500/30 hover:to-red-500/30 border border-amber-500/30 rounded-lg text-xs text-amber-300 font-medium transition-all"
                 >
-                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    <path d="M18 6L6 18M6 6l12 12" />
-                  </svg>
+                  + Add Friendship
                 </button>
-              </div>
-            ))}
-
-            {loading && (
-              <div className="flex items-center gap-2 bg-white/[0.03] border border-white/[0.06] rounded-full px-3 py-1 animate-pulse">
-                <div className="w-5 h-5 rounded-full bg-white/10" />
-                <span className="text-xs text-gray-500">{loading}</span>
-              </div>
-            )}
-          </div>
-
-          {/* Stats badge */}
-          {nodes.length >= 2 && !txLoading && (
-            <div className="flex-shrink-0 flex items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-1.5">
-              <div className="text-center">
-                <div className="text-xs font-semibold text-white">{strongEdges.length}</div>
-                <div className="text-[9px] text-gray-500">links</div>
-              </div>
-              <div className="w-px h-5 bg-white/10" />
-              <div className="text-center">
-                <div className="text-xs font-semibold text-white">{nodes.length}</div>
-                <div className="text-[9px] text-gray-500">nodes</div>
-              </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-amber-400/80">
+                    {selectedNodes.length === 0
+                      ? "Select first node"
+                      : selectedNodes.length === 1
+                        ? "Select second node"
+                        : "Ready to connect"}
+                  </span>
+                  {selectedNodes.length === 2 && (
+                    <button
+                      onClick={addFriendship}
+                      disabled={friendshipLoading}
+                      className="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-red-500 rounded-lg text-xs text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
+                    >
+                      {friendshipLoading ? "Saving\u2026" : "Confirm"}
+                    </button>
+                  )}
+                  <button
+                    onClick={cancelSelection}
+                    className="px-2 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs text-gray-400 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -268,21 +473,87 @@ export default function GraphPage() {
 
       {/* Graph */}
       <div className="flex-1 min-h-0 relative">
-        <NetworkGraph nodes={nodes} edges={edges} onNodeClick={handleNodeClick} />
+        <NetworkGraph
+          nodes={nodes}
+          edges={edges}
+          onNodeClick={handleNodeClick}
+          selectedNodes={selectedNodes}
+          onNodeSelect={handleNodeSelect}
+          onEdgeClick={handleEdgeClick}
+          selectionMode={selectionMode}
+        />
         {txLoading && (
           <div className="absolute top-3 right-3 flex items-center gap-2 bg-dark-100/90 border border-white/10 rounded-lg px-3 py-1.5 backdrop-blur-sm">
             <div className="w-3 h-3 border-2 border-accent-purple/40 border-t-accent-purple rounded-full animate-spin" />
-            <span className="text-xs text-gray-400">Analyzing on-chain relationships...</span>
+            <span className="text-xs text-gray-400">Checking on-chain transactions...</span>
+          </div>
+        )}
+        {friendshipLoading && (
+          <div className="absolute top-3 left-3 flex items-center gap-2 bg-dark-100/90 border border-amber-500/20 rounded-lg px-3 py-1.5 backdrop-blur-sm">
+            <div className="w-3 h-3 border-2 border-amber-500/40 border-t-amber-500 rounded-full animate-spin" />
+            <span className="text-xs text-amber-400/80">Updating friendships...</span>
           </div>
         )}
       </div>
 
-      {/* Footer hint */}
+      {/* Legend + Footer */}
       {nodes.length > 0 && (
-        <p className="text-center text-gray-600 text-[10px] mt-2 flex-shrink-0">
-          Drag nodes to rearrange &middot; Scroll to zoom &middot; Click node to view profile
-          &middot; Hover edges for details &middot; Thicker lines = stronger on-chain relationship
-        </p>
+        <div className="flex items-center justify-center gap-6 mt-2 flex-shrink-0">
+          {inferredCount > 0 && (
+            <div className="flex items-center gap-1.5">
+              <div className="w-6 h-0.5 bg-gradient-to-r from-accent-purple to-accent-green rounded" />
+              <span className="text-[10px] text-gray-500">On-chain transactions</span>
+            </div>
+          )}
+          {friendshipCount > 0 && (
+            <div className="flex items-center gap-1.5">
+              <div className="w-6 h-0.5 bg-gradient-to-r from-amber-500 to-red-500 rounded" />
+              <span className="text-[10px] text-gray-500">Manual friendships ({friendshipCount})</span>
+            </div>
+          )}
+          <span className="text-[10px] text-gray-600">
+            Drag nodes &middot; Scroll to zoom &middot; Click node to view profile &middot; Click friendship edge to remove
+          </span>
+        </div>
+      )}
+
+      {/* Friendships Panel */}
+      <FriendshipsPanel
+        isOpen={panelOpen}
+        onClose={() => setPanelOpen(false)}
+        graphNodeNames={nodes.map((n) => n.ensName)}
+        onFriendshipsChanged={refreshFriendshipEdges}
+      />
+
+      {/* Toast notification */}
+      {toast && (
+        <div
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-2.5 px-4 py-2.5 rounded-xl border backdrop-blur-xl shadow-2xl shadow-black/40 animate-[slideUp_0.3s_ease-out] ${
+            toast.type === "success"
+              ? "bg-green-500/10 border-green-500/25 text-green-300"
+              : "bg-red-500/10 border-red-500/25 text-red-300"
+          }`}
+        >
+          {toast.type === "success" ? (
+            <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M20 6L9 17l-5-5" />
+            </svg>
+          ) : (
+            <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M15 9l-6 6M9 9l6 6" />
+            </svg>
+          )}
+          <span className="text-sm font-medium">{toast.message}</span>
+          <button
+            onClick={() => setToast(null)}
+            className="ml-1 p-0.5 rounded hover:bg-white/10 transition-colors"
+          >
+            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
       )}
     </main>
   );
