@@ -31,13 +31,11 @@ export interface GraphNode {
 export interface GraphEdge {
   source: string;
   target: string;
-  directTxCount: number;
+  txCount: number;
   totalValueEth: string;
   lastTxTimestamp: number | null;
-  sharedTokens: string[];
-  sharedContracts: number;
-  strength: number;
-  label: string;
+  types: string[]; // e.g. ["eth", "erc20", "internal"]
+  edgeType: "inferred" | "friendship";
 }
 
 interface SimNode extends SimulationNodeDatum {
@@ -55,6 +53,10 @@ interface Props {
   nodes: GraphNode[];
   edges: GraphEdge[];
   onNodeClick: (ensName: string) => void;
+  selectedNodes: string[];
+  onNodeSelect: (ensName: string) => void;
+  onEdgeClick: (source: string, target: string, edgeType: "inferred" | "friendship") => void;
+  selectionMode: boolean;
 }
 
 function shortenAddress(address: string | null): string {
@@ -75,14 +77,15 @@ function getSimNode(link: SimLink, which: "source" | "target"): SimNode | null {
   return typeof val === "object" ? (val as SimNode) : null;
 }
 
-function edgeColor(strength: number): string {
-  if (strength >= 50) return "#8b5cf6";
-  if (strength >= 20) return "#3b82f6";
-  if (strength > 0) return "#6b7280";
-  return "#374151";
-}
-
-export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
+export function NetworkGraph({
+  nodes,
+  edges,
+  onNodeClick,
+  selectedNodes,
+  onNodeSelect,
+  onEdgeClick,
+  selectionMode,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const simulationRef = useRef<Simulation<SimNode, SimLink>>();
@@ -121,14 +124,12 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
     return () => observer.disconnect();
   }, []);
 
-  // Only create sim links for edges with strength > 0
-  const activeEdges = edges.filter((e) => e.strength > 0);
-
   // Rebuild simulation when nodes/edges/dimensions change
   useEffect(() => {
     const { width, height } = dimensions;
     if (width === 0 || height === 0) return;
 
+    // Preserve positions of existing nodes
     const posMap = new Map<string, { x: number; y: number; vx: number; vy: number }>();
     for (const n of simNodesRef.current) {
       if (n.x !== undefined && n.y !== undefined) {
@@ -140,14 +141,13 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
       const prev = posMap.get(n.id);
       return {
         ...n,
-        x: prev?.x ?? width / 2 + (Math.random() - 0.5) * 200,
-        y: prev?.y ?? height / 2 + (Math.random() - 0.5) * 200,
+        x: prev?.x ?? width / 2 + (Math.random() - 0.5) * 120,
+        y: prev?.y ?? height / 2 + (Math.random() - 0.5) * 120,
         vx: prev?.vx ?? 0,
         vy: prev?.vy ?? 0,
       };
     });
 
-    // Create links for ALL edges (even weak ones) so simulation positions them
     const simLinks: SimLink[] = edges.map((e) => ({
       source: e.source,
       target: e.target,
@@ -163,19 +163,12 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
         "link",
         forceLink<SimNode, SimLink>(simLinks)
           .id((d) => d.id)
-          .distance((_, i) => {
-            const edge = edges[i];
-            // Stronger relationships = closer nodes
-            return edge && edge.strength > 0 ? 180 - edge.strength : 280;
-          })
-          .strength((_, i) => {
-            const edge = edges[i];
-            return edge && edge.strength > 0 ? 0.5 : 0.05;
-          })
+          .distance(200)
+          .strength(0.4)
       )
-      .force("charge", forceManyBody<SimNode>().strength(-800))
-      .force("center", forceCenter(width / 2, height / 2).strength(0.06))
-      .force("collision", forceCollide<SimNode>().radius(70))
+      .force("charge", forceManyBody<SimNode>().strength(-600))
+      .force("center", forceCenter(width / 2, height / 2).strength(0.08))
+      .force("collision", forceCollide<SimNode>().radius(65))
       .alpha(posMap.size > 0 ? 0.4 : 1)
       .alphaDecay(0.02)
       .on("tick", forceRender);
@@ -185,7 +178,7 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
     return () => {
       sim.stop();
     };
-  }, [nodes, edges, activeEdges.length, dimensions, forceRender]);
+  }, [nodes, edges, dimensions, forceRender]);
 
   // Zoom
   const handleWheel = useCallback((e: React.WheelEvent) => {
@@ -304,6 +297,8 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
     }
   }
 
+  const selectedSet = new Set(selectedNodes);
+
   return (
     <div
       ref={containerRef}
@@ -317,7 +312,7 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
           ref={svgRef}
           width={dimensions.width}
           height={dimensions.height}
-          className="cursor-grab active:cursor-grabbing select-none"
+          className={selectionMode ? "cursor-crosshair select-none" : "cursor-grab active:cursor-grabbing select-none"}
           onWheel={handleWheel}
           onPointerDown={handleBgPointerDown}
           onPointerMove={handleBgPointerMove}
@@ -326,6 +321,14 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
           <defs>
             <filter id="node-glow" x="-80%" y="-80%" width="260%" height="260%">
               <feGaussianBlur stdDeviation="10" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+
+            <filter id="selected-glow" x="-80%" y="-80%" width="260%" height="260%">
+              <feGaussianBlur stdDeviation="14" result="blur" />
               <feMerge>
                 <feMergeNode in="blur" />
                 <feMergeNode in="SourceGraphic" />
@@ -341,6 +344,53 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
               <stop offset="0%" stopColor="#3b82f6" />
               <stop offset="100%" stopColor="#10b981" />
             </linearGradient>
+
+            <linearGradient id="ring-selected" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="#f59e0b" />
+              <stop offset="100%" stopColor="#ef4444" />
+            </linearGradient>
+
+            <linearGradient id="friendship-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="#f59e0b" />
+              <stop offset="100%" stopColor="#ef4444" />
+            </linearGradient>
+
+            {/* Per-edge gradients */}
+            {simLinksRef.current.map((link, i) => {
+              const s = getSimNode(link, "source");
+              const t = getSimNode(link, "target");
+              if (!s || !t) return null;
+              const matchingEdge = edges.find(
+                (e) =>
+                  (e.source === getSourceId(link) && e.target === getTargetId(link)) ||
+                  (e.source === getTargetId(link) && e.target === getSourceId(link))
+              );
+              const isFriendship = matchingEdge?.edgeType === "friendship";
+              return (
+                <linearGradient
+                  key={`eg-${i}`}
+                  id={`eg-${i}`}
+                  gradientUnits="userSpaceOnUse"
+                  x1={s.x}
+                  y1={s.y}
+                  x2={t.x}
+                  y2={t.y}
+                >
+                  {isFriendship ? (
+                    <>
+                      <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.7" />
+                      <stop offset="100%" stopColor="#ef4444" stopOpacity="0.7" />
+                    </>
+                  ) : (
+                    <>
+                      <stop offset="0%" stopColor="#8b5cf6" stopOpacity="0.6" />
+                      <stop offset="50%" stopColor="#3b82f6" stopOpacity="0.15" />
+                      <stop offset="100%" stopColor="#10b981" stopOpacity="0.6" />
+                    </>
+                  )}
+                </linearGradient>
+              );
+            })}
           </defs>
 
           {/* Transform group */}
@@ -351,67 +401,138 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
               const t = getSimNode(link, "target");
               if (!s?.x || !t?.x || !s?.y || !t?.y) return null;
 
-              const edge = edges[i];
-              if (!edge) return null;
-
-              const hasRelationship = edge.strength > 0;
               const edgeConnected =
                 !hoveredNode || (connectedSet.has(getSourceId(link)) && connectedSet.has(getTargetId(link)));
-              const isEdgeHovered = hoveredEdge === i;
 
+              const matchingEdge = edges.find(
+                (e) =>
+                  (e.source === getSourceId(link) && e.target === getTargetId(link)) ||
+                  (e.source === getTargetId(link) && e.target === getSourceId(link))
+              );
+
+              const isFriendship = matchingEdge?.edgeType === "friendship";
+              const hasTx = matchingEdge && matchingEdge.txCount > 0;
+              const hasContent = hasTx || isFriendship;
               const midX = (s.x + t.x) / 2;
               const midY = (s.y + t.y) / 2;
-
-              const strokeWidth = hasRelationship
-                ? Math.max(1.5, Math.min(5, edge.strength / 15))
-                : 0.5;
-
-              const color = edgeColor(edge.strength);
+              const isEdgeHovered = hoveredEdge === i;
 
               return (
                 <g key={`e-${i}`}>
-                  {/* Hit area for hover */}
+                  {/* Invisible wider line for easier click target */}
                   <line
                     x1={s.x}
                     y1={s.y}
                     x2={t.x}
                     y2={t.y}
                     stroke="transparent"
-                    strokeWidth="20"
-                    style={{ cursor: hasRelationship ? "pointer" : "default" }}
+                    strokeWidth={20}
+                    style={{ cursor: isFriendship ? "pointer" : "default" }}
                     onMouseEnter={() => setHoveredEdge(i)}
                     onMouseLeave={() => setHoveredEdge(null)}
+                    onClick={(e) => {
+                      if (matchingEdge) {
+                        e.stopPropagation();
+                        onEdgeClick(getSourceId(link), getTargetId(link), matchingEdge.edgeType);
+                      }
+                    }}
                   />
-
-                  {/* Visible edge */}
                   <line
                     x1={s.x}
                     y1={s.y}
                     x2={t.x}
                     y2={t.y}
-                    stroke={color}
-                    strokeWidth={isEdgeHovered ? strokeWidth + 1 : strokeWidth}
-                    strokeDasharray={hasRelationship ? undefined : "3 6"}
+                    stroke={hasContent ? `url(#eg-${i})` : "#374151"}
+                    strokeWidth={
+                      isFriendship
+                        ? isEdgeHovered ? 4 : 2.5
+                        : hasTx
+                          ? (hoveredNode && edgeConnected ? 3 : 2)
+                          : 1
+                    }
+                    strokeDasharray={isFriendship ? undefined : hasTx ? undefined : "4 4"}
                     opacity={
                       hoveredNode
-                        ? edgeConnected
-                          ? hasRelationship ? 0.8 : 0.15
-                          : 0.04
-                        : isEdgeHovered
-                          ? 0.9
-                          : hasRelationship ? 0.5 : 0.1
+                        ? edgeConnected ? 0.9 : 0.06
+                        : isEdgeHovered ? 1 : hasContent ? 0.5 : 0.15
                     }
-                    style={{ transition: "opacity 0.3s, stroke-width 0.3s" }}
+                    style={{
+                      transition: "opacity 0.3s, stroke-width 0.3s",
+                      pointerEvents: "none",
+                    }}
                   />
 
-                  {/* Edge label — show on hover or always for strong edges */}
-                  {hasRelationship && (isEdgeHovered || edge.strength >= 30) && (
+                  {/* Edge label */}
+                  {hasContent && (
                     <g
                       transform={`translate(${midX},${midY})`}
-                      opacity={hoveredNode ? (edgeConnected ? 1 : 0.06) : isEdgeHovered ? 1 : 0.75}
-                      style={{ transition: "opacity 0.3s" }}
+                      opacity={hoveredNode ? (edgeConnected ? 1 : 0.06) : isEdgeHovered ? 1 : 0.85}
+                      style={{ transition: "opacity 0.3s", cursor: isFriendship ? "pointer" : "default" }}
+                      onClick={(e) => {
+                        if (matchingEdge) {
+                          e.stopPropagation();
+                          onEdgeClick(getSourceId(link), getTargetId(link), matchingEdge.edgeType);
+                        }
+                      }}
                     >
-                      <EdgeLabel edge={edge} />
+                      <rect
+                        x={isFriendship ? "-38" : "-42"}
+                        y="-18"
+                        width={isFriendship ? "76" : "84"}
+                        height="36"
+                        rx="10"
+                        fill={isFriendship ? "#2d1f0e" : "#1e2028"}
+                        stroke={isFriendship ? (isEdgeHovered ? "#f59e0b" : "#78350f") : "#374151"}
+                        strokeWidth={isEdgeHovered ? "1.5" : "0.5"}
+                        opacity="0.95"
+                      />
+                      {isFriendship ? (
+                        <>
+                          <text
+                            textAnchor="middle"
+                            y="-2"
+                            fill="#fbbf24"
+                            fontSize="9"
+                            fontWeight="600"
+                            style={{ pointerEvents: "none", userSelect: "none" }}
+                          >
+                            friend
+                          </text>
+                          <text
+                            textAnchor="middle"
+                            y="10"
+                            fill="#92400e"
+                            fontSize="7"
+                            style={{ pointerEvents: "none", userSelect: "none" }}
+                          >
+                            {isEdgeHovered ? "click to remove" : "manual"}
+                          </text>
+                        </>
+                      ) : (
+                        <>
+                          <text
+                            textAnchor="middle"
+                            y="-4"
+                            fill="#d1d5db"
+                            fontSize="9"
+                            fontWeight="600"
+                            style={{ pointerEvents: "none", userSelect: "none" }}
+                          >
+                            {matchingEdge!.txCount} tx
+                          </text>
+                          <text
+                            textAnchor="middle"
+                            y="10"
+                            fill="#6b7280"
+                            fontSize="7"
+                            style={{ pointerEvents: "none", userSelect: "none" }}
+                          >
+                            {parseFloat(matchingEdge!.totalValueEth) > 0
+                              ? `${parseFloat(matchingEdge!.totalValueEth).toFixed(2)} ETH`
+                              : matchingEdge!.types.includes("erc20") ? "token transfers" : "contract calls"}
+                          </text>
+                        </>
+                      )}
                     </g>
                   )}
                 </g>
@@ -424,7 +545,12 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
 
               const isHighlighted = !hoveredNode || connectedSet.has(node.id);
               const isHovered = hoveredNode === node.id;
-              const gradId = idx % 2 === 0 ? "ring-grad" : "ring-grad-green";
+              const isSelected = selectedSet.has(node.id);
+              const gradId = isSelected
+                ? "ring-selected"
+                : idx % 2 === 0
+                  ? "ring-grad"
+                  : "ring-grad-green";
 
               return (
                 <g
@@ -433,7 +559,7 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
                   style={{
                     opacity: hoveredNode ? (isHighlighted ? 1 : 0.12) : 1,
                     transition: "opacity 0.3s",
-                    cursor: "pointer",
+                    cursor: selectionMode ? "crosshair" : "pointer",
                   }}
                   onPointerDown={(e) => handleNodePointerDown(e, node.id)}
                   onPointerMove={handleNodePointerMove}
@@ -441,15 +567,34 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
                   onClick={() => {
-                    if (!lastDragDidMoveRef.current) onNodeClick(node.ensName);
-                    lastDragDidMoveRef.current = false;
+                    if (lastDragDidMoveRef.current) {
+                      lastDragDidMoveRef.current = false;
+                      return;
+                    }
+                    if (selectionMode) {
+                      onNodeSelect(node.ensName);
+                    } else {
+                      onNodeClick(node.ensName);
+                    }
                   }}
                 >
+                  {/* Selection glow */}
+                  {isSelected && (
+                    <circle
+                      r="40"
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth="3"
+                      opacity={0.6}
+                      filter="url(#selected-glow)"
+                    />
+                  )}
+
                   {/* Glow ring on hover */}
                   <circle
                     r="38"
                     fill="none"
-                    stroke="#8b5cf6"
+                    stroke={isSelected ? "#f59e0b" : "#8b5cf6"}
                     strokeWidth="2.5"
                     opacity={isHovered ? 0.5 : 0}
                     filter="url(#node-glow)"
@@ -457,7 +602,7 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
                   />
 
                   {/* Outer ring */}
-                  <circle r="32" fill="#0e0f14" stroke={`url(#${gradId})`} strokeWidth="2.5" />
+                  <circle r="32" fill="#0e0f14" stroke={`url(#${gradId})`} strokeWidth={isSelected ? "3.5" : "2.5"} />
 
                   {/* Inner fill */}
                   <circle r="29" fill="#1e2028" />
@@ -538,6 +683,23 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
                       </text>
                     </g>
                   )}
+
+                  {/* Selection order badge */}
+                  {isSelected && (
+                    <g transform="translate(-22, -22)">
+                      <circle r="10" fill="#f59e0b" />
+                      <text
+                        textAnchor="middle"
+                        y="4"
+                        fill="#1e2028"
+                        fontSize="10"
+                        fontWeight="bold"
+                        style={{ pointerEvents: "none", userSelect: "none" }}
+                      >
+                        {selectedNodes.indexOf(node.ensName) + 1}
+                      </text>
+                    </g>
+                  )}
                 </g>
               );
             })}
@@ -545,63 +707,6 @@ export function NetworkGraph({ nodes, edges, onNodeClick }: Props) {
         </svg>
       )}
     </div>
-  );
-}
-
-function EdgeLabel({ edge }: { edge: GraphEdge }) {
-  const lines: Array<{ text: string; color: string; bold?: boolean }> = [];
-
-  if (edge.directTxCount > 0) {
-    const ethVal = parseFloat(edge.totalValueEth);
-    let txLine = `${edge.directTxCount} transaction${edge.directTxCount > 1 ? "s" : ""}`;
-    if (ethVal > 0.001) txLine += ` \u00b7 ${ethVal.toFixed(2)} ETH`;
-    lines.push({ text: txLine, color: "#d1d5db", bold: true });
-  }
-
-  if (edge.sharedTokens.length > 0) {
-    const shown = edge.sharedTokens.slice(0, 4).join(", ");
-    const extra = edge.sharedTokens.length > 4 ? ` +${edge.sharedTokens.length - 4}` : "";
-    lines.push({ text: `Shared: ${shown}${extra}`, color: "#8b5cf6" });
-  }
-
-  if (edge.sharedContracts > 0 && lines.length < 3) {
-    lines.push({ text: `${edge.sharedContracts} shared contracts`, color: "#6b7280" });
-  }
-
-  if (lines.length === 0) return null;
-
-  const lineHeight = 14;
-  const totalHeight = lines.length * lineHeight + 12;
-  const maxWidth = Math.max(...lines.map((l) => l.text.length * 5.5)) + 20;
-  const halfW = maxWidth / 2;
-
-  return (
-    <>
-      <rect
-        x={-halfW}
-        y={-totalHeight / 2}
-        width={maxWidth}
-        height={totalHeight}
-        rx="8"
-        fill="#1a1b22"
-        stroke="#374151"
-        strokeWidth="0.5"
-        opacity="0.95"
-      />
-      {lines.map((line, i) => (
-        <text
-          key={i}
-          textAnchor="middle"
-          y={-totalHeight / 2 + 12 + i * lineHeight}
-          fill={line.color}
-          fontSize={line.bold ? "9" : "8"}
-          fontWeight={line.bold ? "600" : "400"}
-          style={{ pointerEvents: "none", userSelect: "none" }}
-        >
-          {line.text}
-        </text>
-      ))}
-    </>
   );
 }
 
